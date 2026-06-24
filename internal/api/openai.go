@@ -12,6 +12,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
+	"github.com/fastclaw-ai/fastclaw/internal/users"
 )
 
 // chatCompletionRequest mirrors the OpenAI chat completion request.
@@ -219,7 +220,7 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.AgentID != "" {
 		agentID = req.AgentID
 	}
-	ag := resolveAgent(space, agentID)
+	ag := s.resolveRequestAgent(r, space, agentID)
 	if ag == nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{
 			"error": map[string]string{"message": "agent not found", "type": "not_found_error"},
@@ -469,4 +470,27 @@ func resolveAgent(space *UserSpaceView, agentID string) *agent.Agent {
 		return all[0]
 	}
 	return nil
+}
+
+func (s *Server) resolveRequestAgent(r *http.Request, space *UserSpaceView, agentID string) *agent.Agent {
+	ag := resolveAgent(space, agentID)
+	if ag != nil || agentID == "" {
+		return ag
+	}
+	ident, ok := auth.FromContext(r.Context())
+	if !ok || !ident.CanAccessAgent(agentID) {
+		return nil
+	}
+	injector, ok := s.resolver.(AgentInjector)
+	if !ok {
+		return nil
+	}
+	if ident.AuthMethod != "apikey" && ident.Role != users.RoleSuperAdmin {
+		return nil
+	}
+	if err := injector.EnsureAgent(r.Context(), ident.EffectiveUserID(), agentID); err != nil {
+		slog.Warn("failed to attach agent for chat completion", "agent_id", agentID, "user_id", ident.EffectiveUserID(), "error", err)
+		return nil
+	}
+	return space.Agents.AgentByID(agentID)
 }
