@@ -2,6 +2,8 @@ package api
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
@@ -66,5 +68,43 @@ func TestChatCompletionImageUrlsAliasAlone(t *testing.T) {
 	}
 	if got := req.allAttachments(); len(got) != 1 || got[0].URL != "https://x/a.png" {
 		t.Errorf("allAttachments = %+v", got)
+	}
+}
+
+func TestChatCompletionPreferRespondAsync(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Add("Prefer", "wait=30, respond-async")
+	if !wantsAsyncChatCompletion(req) {
+		t.Fatal("Prefer: respond-async was not detected")
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Add("Prefer", "RESPOND-ASYNC")
+	if !wantsAsyncChatCompletion(req) {
+		t.Fatal("Prefer: RESPOND-ASYNC should be case-insensitive")
+	}
+
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Add("Prefer", "wait=30")
+	if wantsAsyncChatCompletion(req) {
+		t.Fatal("Prefer without respond-async should not request async acceptance")
+	}
+}
+
+func TestChatCompletionAcceptedResponseShape(t *testing.T) {
+	rr := httptest.NewRecorder()
+	var srv Server
+	srv.acceptedResponse(rr, "chatcmpl-123", "research-model", 1782240000)
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusAccepted)
+	}
+
+	var body chatCompletionAcceptedResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal accepted response: %v", err)
+	}
+	if body.ID != "chatcmpl-123" || body.Object != "chat.completion.accepted" || body.Model != "research-model" || body.Created != 1782240000 {
+		t.Fatalf("accepted response = %+v", body)
 	}
 }
