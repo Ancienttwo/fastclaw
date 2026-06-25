@@ -1348,17 +1348,8 @@ func requiredToolSequenceFromParams(params map[string]any, tools []provider.Tool
 }
 
 func requiredToolSequenceFromText(text string, tools []provider.Tool) *requiredToolSequencePolicy {
-	if strings.TrimSpace(text) == "" {
-		return nil
-	}
-	start := strings.Index(text, "{")
-	if start < 0 {
-		return nil
-	}
-	var payload map[string]any
-	decoder := json.NewDecoder(strings.NewReader(text[start:]))
-	decoder.UseNumber()
-	if err := decoder.Decode(&payload); err != nil {
+	payload := saleskoTaskPayloadFromText(text)
+	if len(payload) == 0 {
 		return nil
 	}
 	requiredTools, ok := payload["required_tools"].(map[string]any)
@@ -1431,6 +1422,114 @@ func requiredToolChoiceMessage(toolName string) provider.Message {
 			"Do not write todo.md and do not use file tools for this turn. The next required tool is `" +
 			toolName + "`. Call that tool now and do not produce a final answer before the required sequence is complete.",
 	}
+}
+
+func synthesizeRequiredToolCallOnNoTool(resp *provider.Response, policy *requiredToolSequencePolicy, params map[string]any, text string, round int) bool {
+	if resp == nil || resp.HasToolCalls() || policy == nil || policy.complete() {
+		return false
+	}
+	tc, ok := requiredSyntheticToolCall(policy.nextTool(), params, text, round)
+	if !ok {
+		return false
+	}
+	resp.Content = ""
+	resp.ToolCalls = []provider.ToolCall{tc}
+	resp.RawAssistant = nil
+	return true
+}
+
+func requiredSyntheticToolCall(toolName string, params map[string]any, text string, round int) (provider.ToolCall, bool) {
+	args, ok := requiredSyntheticToolArgs(toolName, params, text)
+	if !ok {
+		return provider.ToolCall{}, false
+	}
+	blob, err := json.Marshal(args)
+	if err != nil {
+		return provider.ToolCall{}, false
+	}
+	return provider.ToolCall{
+		ID:   fmt.Sprintf("required_%d_%s", round, strings.ReplaceAll(toolName, ".", "_")),
+		Type: "function",
+		Function: provider.FunctionCall{
+			Name:      toolName,
+			Arguments: string(blob),
+		},
+	}, true
+}
+
+func requiredSyntheticToolArgs(toolName string, params map[string]any, text string) (map[string]any, bool) {
+	if !strings.HasSuffix(toolName, "graph_read_job_context") {
+		return nil, false
+	}
+	payloadArgs := saleskoToolArgumentsFromText(text)
+	args := map[string]any{}
+	if value := firstStringArg(params, payloadArgs, "job_id", "salesko_job_id"); value != "" {
+		args["job_id"] = value
+	}
+	if value := firstStringArg(params, payloadArgs, "tenant_id"); value != "" {
+		args["tenant_id"] = value
+	}
+	if value := firstStringArg(params, payloadArgs, "dataset_scope"); value != "" {
+		args["dataset_scope"] = value
+	}
+	if value := firstStringArg(params, payloadArgs, "frame_record_id"); value != "" {
+		args["frame_record_id"] = value
+	}
+	if args["job_id"] == nil || args["tenant_id"] == nil || args["frame_record_id"] == nil {
+		return nil, false
+	}
+	return args, true
+}
+
+func firstStringArg(params map[string]any, payloadArgs map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := stringArg(params, key); value != "" {
+			return value
+		}
+	}
+	for _, key := range keys {
+		if value := stringArg(payloadArgs, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func stringArg(values map[string]any, key string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	value, ok := values[key].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func saleskoToolArgumentsFromText(text string) map[string]any {
+	payload := saleskoTaskPayloadFromText(text)
+	args, ok := payload["tool_arguments"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return args
+}
+
+func saleskoTaskPayloadFromText(text string) map[string]any {
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	start := strings.Index(text, "{")
+	if start < 0 {
+		return nil
+	}
+	var payload map[string]any
+	decoder := json.NewDecoder(strings.NewReader(text[start:]))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return nil
+	}
+	return payload
 }
 
 func hasToolName(tools []provider.Tool, name string) bool {
@@ -2251,6 +2350,14 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		}
 		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
 		a.maybeRecoverToolCalls(resp)
+
+		if !resp.HasToolCalls() && synthesizeRequiredToolCallOnNoTool(resp, requiredToolPolicy, msg.Params, msg.Text, i+1) {
+			slog.Warn("synthesized required tool call after no-tool response",
+				"agent", a.name,
+				"tool", resp.ToolCalls[0].Function.Name,
+				"iteration", i+1,
+			)
+		}
 
 		if !resp.HasToolCalls() {
 			if requiredToolPolicy.canRetryNoTool() {
