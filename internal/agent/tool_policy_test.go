@@ -90,6 +90,7 @@ func TestRequiredSyntheticToolCallReadsSaleskoArgsFromParams(t *testing.T) {
 			"frame_record_id": "frame-1",
 		},
 		"",
+		nil,
 		2,
 	)
 	if !ok {
@@ -128,7 +129,7 @@ func TestRequiredSyntheticToolCallReadsSaleskoArgsFromPrompt(t *testing.T) {
     "frame_record_id": "frame-from-text"
   }
 }`
-	call, ok := requiredSyntheticToolCall("mcp_salesko_graph_read_job_context", nil, prompt, 1)
+	call, ok := requiredSyntheticToolCall("mcp_salesko_graph_read_job_context", nil, prompt, nil, 1)
 	if !ok {
 		t.Fatal("synthetic tool call was not created")
 	}
@@ -151,7 +152,7 @@ func TestSynthesizeRequiredToolCallClearsRawAssistant(t *testing.T) {
 		"salesko_job_id":  "job-1",
 		"tenant_id":       "tenant-1",
 		"frame_record_id": "frame-1",
-	}, "", 1)
+	}, "", nil, 1)
 	if !ok {
 		t.Fatal("expected synthetic tool call")
 	}
@@ -166,12 +167,103 @@ func TestSynthesizeRequiredToolCallClearsRawAssistant(t *testing.T) {
 	}
 }
 
-func TestRequiredSyntheticToolCallDoesNotInventSubmitProposal(t *testing.T) {
+func TestRequiredSyntheticToolCallBuildsSubmitProposalFromReadContext(t *testing.T) {
+	context := map[string]any{
+		"currentFrameVersion": float64(3),
+		"targetEntity": map[string]any{
+			"id":           "canonical:person:alice",
+			"latestNodeId": "person-alice",
+		},
+		"baseFrame": map[string]any{
+			"schemaVersion": "graph.visualization.v1",
+			"graph": map[string]any{
+				"nodes": []any{
+					map[string]any{
+						"id":         "person-alice",
+						"type":       "person",
+						"label":      "Alice Chen",
+						"confidence": float64(0.9),
+						"visual": map[string]any{
+							"position": map[string]any{"x": float64(0), "y": float64(0), "z": float64(0)},
+							"color":    "#2563eb",
+							"size":     float64(1),
+							"emphasis": "focused",
+						},
+						"data": map[string]any{"canonicalEntityId": "canonical:person:alice"},
+					},
+				},
+				"edges": []any{},
+			},
+			"ui": map[string]any{
+				"activeView":           "graph",
+				"productName":          "Salesko",
+				"searchPlaceholder":    "Search people...",
+				"filters":              []any{},
+				"relationshipStrength": float64(0.5),
+				"detailPanel":          map[string]any{"title": "Alice Chen", "tags": []any{}, "linkedNodeIds": []any{}},
+				"stats":                map[string]any{"people": float64(1), "organisations": float64(0), "events": float64(0), "opportunities": float64(0)},
+			},
+			"camera":   map[string]any{"position": map[string]any{"x": float64(0), "y": float64(0), "z": float64(6)}, "mode": "overview"},
+			"commands": []any{},
+			"facets":   map[string]any{"entityTypes": []any{"person"}, "relationTypes": []any{}, "warnings": []any{}},
+			"frameId":  "frame-1",
+			"source":   "deterministic-rule",
+			"summary":  "Alice context.",
+			"timeline": []any{},
+		},
+	}
+	contextBlob, err := json.Marshal(context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call, ok := requiredSyntheticToolCall("mcp_salesko_graph_submit_proposal", map[string]any{
+		"salesko_job_id":         "job-1",
+		"tenant_id":              "tenant-1",
+		"dataset_scope":          "salesko",
+		"frame_record_id":        "frame-record-1",
+		"expected_frame_version": float64(3),
+	}, "", []provider.Message{{
+		Role:    "tool",
+		Name:    "mcp_salesko_graph_read_job_context",
+		Content: string(contextBlob),
+	}}, 2)
+	if !ok {
+		t.Fatal("synthetic submit proposal was not created")
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(call.Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments are not JSON: %v", err)
+	}
+	if args["base_frame_record_id"] != "frame-record-1" {
+		t.Fatalf("base_frame_record_id = %v", args["base_frame_record_id"])
+	}
+	if args["stop_reason"] != "provider_limit" {
+		t.Fatalf("stop_reason = %v", args["stop_reason"])
+	}
+	proposal, ok := args["proposed_change_set"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing proposed_change_set: %s", call.Function.Arguments)
+	}
+	commands, ok := proposal["commands"].([]any)
+	if !ok || len(commands) != 1 {
+		t.Fatalf("commands = %#v", proposal["commands"])
+	}
+	command, ok := commands[0].(map[string]any)
+	if !ok || command["type"] != "upsert_node" {
+		t.Fatalf("command = %#v", commands[0])
+	}
+	node, ok := command["node"].(map[string]any)
+	if !ok || node["label"] != "Alice Chen" {
+		t.Fatalf("node = %#v", command["node"])
+	}
+}
+
+func TestRequiredSyntheticToolCallDoesNotInventSubmitProposalWithoutContext(t *testing.T) {
 	if _, ok := requiredSyntheticToolCall("mcp_salesko_graph_submit_proposal", map[string]any{
 		"salesko_job_id":  "job-1",
 		"tenant_id":       "tenant-1",
 		"frame_record_id": "frame-1",
-	}, "", 1); ok {
+	}, "", nil, 1); ok {
 		t.Fatal("submit proposal should not be synthesized without context/result payload")
 	}
 }

@@ -1424,11 +1424,11 @@ func requiredToolChoiceMessage(toolName string) provider.Message {
 	}
 }
 
-func synthesizeRequiredToolCallOnNoTool(resp *provider.Response, policy *requiredToolSequencePolicy, params map[string]any, text string, round int) bool {
+func synthesizeRequiredToolCallOnNoTool(resp *provider.Response, policy *requiredToolSequencePolicy, params map[string]any, text string, messages []provider.Message, round int) bool {
 	if resp == nil || resp.HasToolCalls() || policy == nil || policy.complete() {
 		return false
 	}
-	tc, ok := requiredSyntheticToolCall(policy.nextTool(), params, text, round)
+	tc, ok := requiredSyntheticToolCall(policy.nextTool(), params, text, messages, round)
 	if !ok {
 		return false
 	}
@@ -1438,8 +1438,8 @@ func synthesizeRequiredToolCallOnNoTool(resp *provider.Response, policy *require
 	return true
 }
 
-func requiredSyntheticToolCall(toolName string, params map[string]any, text string, round int) (provider.ToolCall, bool) {
-	args, ok := requiredSyntheticToolArgs(toolName, params, text)
+func requiredSyntheticToolCall(toolName string, params map[string]any, text string, messages []provider.Message, round int) (provider.ToolCall, bool) {
+	args, ok := requiredSyntheticToolArgs(toolName, params, text, messages)
 	if !ok {
 		return provider.ToolCall{}, false
 	}
@@ -1457,10 +1457,18 @@ func requiredSyntheticToolCall(toolName string, params map[string]any, text stri
 	}, true
 }
 
-func requiredSyntheticToolArgs(toolName string, params map[string]any, text string) (map[string]any, bool) {
-	if !strings.HasSuffix(toolName, "graph_read_job_context") {
+func requiredSyntheticToolArgs(toolName string, params map[string]any, text string, messages []provider.Message) (map[string]any, bool) {
+	switch {
+	case strings.HasSuffix(toolName, "graph_read_job_context"):
+		return requiredSyntheticReadContextArgs(params, text)
+	case strings.HasSuffix(toolName, "graph_submit_proposal"):
+		return requiredSyntheticSubmitProposalArgs(params, text, messages)
+	default:
 		return nil, false
 	}
+}
+
+func requiredSyntheticReadContextArgs(params map[string]any, text string) (map[string]any, bool) {
 	payloadArgs := saleskoToolArgumentsFromText(text)
 	args := map[string]any{}
 	if value := firstStringArg(params, payloadArgs, "job_id", "salesko_job_id"); value != "" {
@@ -1479,6 +1487,138 @@ func requiredSyntheticToolArgs(toolName string, params map[string]any, text stri
 		return nil, false
 	}
 	return args, true
+}
+
+func requiredSyntheticSubmitProposalArgs(params map[string]any, text string, messages []provider.Message) (map[string]any, bool) {
+	payloadArgs := saleskoToolArgumentsFromText(text)
+	contextResult := lastRequiredReadContextResult(messages)
+	baseFrame, ok := mapArg(contextResult, "baseFrame")
+	if !ok {
+		return nil, false
+	}
+	targetNode, ok := targetNodeFromReadContext(contextResult)
+	if !ok {
+		return nil, false
+	}
+	jobID := firstStringArg(params, payloadArgs, "job_id", "salesko_job_id")
+	tenantID := firstStringArg(params, payloadArgs, "tenant_id")
+	frameRecordID := firstStringArg(params, payloadArgs, "frame_record_id")
+	if jobID == "" || tenantID == "" || frameRecordID == "" {
+		return nil, false
+	}
+	baseFrameVersion := firstPositiveIntArg(params, payloadArgs, "expected_frame_version", "base_frame_version")
+	if baseFrameVersion == 0 {
+		baseFrameVersion = positiveIntArg(contextResult, "currentFrameVersion")
+	}
+	if baseFrameVersion == 0 {
+		return nil, false
+	}
+	args := map[string]any{
+		"job_id":               jobID,
+		"tenant_id":            tenantID,
+		"base_frame_record_id": frameRecordID,
+		"base_frame_version":   baseFrameVersion,
+		"preview_frame":        baseFrame,
+		"proposed_change_set": map[string]any{
+			"clientMutationId": "fastclaw-required-submit:" + jobID,
+			"reason":           "Provider did not emit the required submit tool call; confirming bounded context without new public-source claims.",
+			"commands": []any{
+				map[string]any{
+					"type": "upsert_node",
+					"node": targetNode,
+				},
+			},
+		},
+		"evidence":    []any{},
+		"warnings":    []any{"public_source_tools_unavailable", "deterministic_submit_fallback_used"},
+		"stop_reason": "provider_limit",
+	}
+	if datasetScope := firstStringArg(params, payloadArgs, "dataset_scope"); datasetScope != "" {
+		args["dataset_scope"] = datasetScope
+	}
+	return args, true
+}
+
+func lastRequiredReadContextResult(messages []provider.Message) map[string]any {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role != "tool" || !strings.HasSuffix(msg.Name, "graph_read_job_context") {
+			continue
+		}
+		var result map[string]any
+		if err := json.Unmarshal([]byte(msg.Content), &result); err != nil {
+			return nil
+		}
+		return result
+	}
+	return nil
+}
+
+func targetNodeFromReadContext(contextResult map[string]any) (map[string]any, bool) {
+	baseFrame, ok := mapArg(contextResult, "baseFrame")
+	if !ok {
+		return nil, false
+	}
+	graph, ok := mapArg(baseFrame, "graph")
+	if !ok {
+		return nil, false
+	}
+	nodes, ok := graph["nodes"].([]any)
+	if !ok || len(nodes) == 0 {
+		return nil, false
+	}
+	if target, ok := mapArg(contextResult, "targetEntity"); ok {
+		if latestNodeID := stringArg(target, "latestNodeId"); latestNodeID != "" {
+			if node, ok := findNodeByID(nodes, latestNodeID); ok {
+				return node, true
+			}
+		}
+		if canonicalID := stringArg(target, "id"); canonicalID != "" {
+			if node, ok := findNodeByCanonicalID(nodes, canonicalID); ok {
+				return node, true
+			}
+		}
+	}
+	node, ok := nodes[0].(map[string]any)
+	return node, ok
+}
+
+func findNodeByID(nodes []any, id string) (map[string]any, bool) {
+	for _, raw := range nodes {
+		node, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if stringArg(node, "id") == id {
+			return node, true
+		}
+	}
+	return nil, false
+}
+
+func findNodeByCanonicalID(nodes []any, canonicalID string) (map[string]any, bool) {
+	for _, raw := range nodes {
+		node, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		data, ok := mapArg(node, "data")
+		if !ok {
+			continue
+		}
+		if stringArg(data, "canonicalEntityId") == canonicalID {
+			return node, true
+		}
+	}
+	return nil, false
+}
+
+func mapArg(values map[string]any, key string) (map[string]any, bool) {
+	if len(values) == 0 {
+		return nil, false
+	}
+	value, ok := values[key].(map[string]any)
+	return value, ok
 }
 
 func firstStringArg(params map[string]any, payloadArgs map[string]any, keys ...string) string {
@@ -1504,6 +1644,41 @@ func stringArg(values map[string]any, key string) string {
 		return ""
 	}
 	return strings.TrimSpace(value)
+}
+
+func firstPositiveIntArg(params map[string]any, payloadArgs map[string]any, keys ...string) int {
+	for _, key := range keys {
+		if value := positiveIntArg(params, key); value > 0 {
+			return value
+		}
+	}
+	for _, key := range keys {
+		if value := positiveIntArg(payloadArgs, key); value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func positiveIntArg(values map[string]any, key string) int {
+	if len(values) == 0 {
+		return 0
+	}
+	switch value := values[key].(type) {
+	case int:
+		if value > 0 {
+			return value
+		}
+	case float64:
+		if value > 0 && value == float64(int(value)) {
+			return int(value)
+		}
+	case json.Number:
+		if i, err := value.Int64(); err == nil && i > 0 {
+			return int(i)
+		}
+	}
+	return 0
 }
 
 func saleskoToolArgumentsFromText(text string) map[string]any {
@@ -2351,7 +2526,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
 		a.maybeRecoverToolCalls(resp)
 
-		if !resp.HasToolCalls() && synthesizeRequiredToolCallOnNoTool(resp, requiredToolPolicy, msg.Params, msg.Text, i+1) {
+		if !resp.HasToolCalls() && synthesizeRequiredToolCallOnNoTool(resp, requiredToolPolicy, msg.Params, msg.Text, messages, i+1) {
 			slog.Warn("synthesized required tool call after no-tool response",
 				"agent", a.name,
 				"tool", resp.ToolCalls[0].Function.Name,
