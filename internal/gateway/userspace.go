@@ -320,7 +320,7 @@ type UserSpace struct {
 	mu sync.Mutex
 }
 
-// readUserScopeAgentDefaults reads the (user=X, agent='') agents.defaults
+// readUserScopeAgentDefaults reads the (user=X, agent=”) agents.defaults
 // row raw — distinct from assembleConfig, which merges system + user and
 // can't tell apart "user explicitly chose the system value" from "no
 // user-scope row at all". EnsureAgent uses this to detect a chatter's
@@ -342,6 +342,15 @@ func readUserScopeAgentDefaults(ctx context.Context, st store.Store, userID stri
 		return out
 	}
 	_ = json.Unmarshal(blob, &out)
+	return out
+}
+
+func cloneStringSlice(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
 	return out
 }
 
@@ -442,6 +451,12 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 			if ovr.PolicyPreset != "" {
 				rc.PolicyPreset = ovr.PolicyPreset
 			}
+			if ovr.PromptMode != "" {
+				rc.PromptMode = ovr.PromptMode
+			}
+			if ovr.BuiltinTools != nil {
+				rc.BuiltinTools = cloneStringSlice(ovr.BuiltinTools)
+			}
 		}
 		// Pull only the owner's user-scope provider rows (not the
 		// owner's full merged view) so we don't re-apply system rows
@@ -492,6 +507,9 @@ func (sp *UserSpace) EnsureAgent(ctx context.Context, st store.Store, mb *bus.Me
 			// in agent-prompt mode because rc.PromptMode stays "").
 			if ovr.PromptMode != "" {
 				rc.PromptMode = ovr.PromptMode
+			}
+			if ovr.BuiltinTools != nil {
+				rc.BuiltinTools = cloneStringSlice(ovr.BuiltinTools)
 			}
 			if ovr.SplitReplies != nil {
 				v := *ovr.SplitReplies
@@ -1076,7 +1094,7 @@ func (r *userSpaceRegistry) startEvictor(ctx context.Context) {
 // per Account.
 //
 // Pulls rows from three ownership corners this user can route:
-//   - (user_id='', agent_id=Y): the agent's "official" rows for any
+//   - (user_id=”, agent_id=Y): the agent's "official" rows for any
 //     agent Y the user owns (legacy / pre-refactor data)
 //   - (user_id=userID, agent_id=Y) where user owns Y: this user's
 //     bindings on their own agent (the normal post-refactor pattern)

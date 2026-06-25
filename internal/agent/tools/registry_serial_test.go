@@ -90,3 +90,48 @@ func TestRegisterSerial_DoesNotBlockOtherTools(t *testing.T) {
 		t.Fatalf("slow tool didn't run: got %q", got)
 	}
 }
+
+func TestDefinitionsForModeFiltersBuiltinsButKeepsMCP(t *testing.T) {
+	r := NewRegistry("", "")
+	t.Cleanup(r.Close)
+	r.RegisterFrom("mcp_sidecar_job", "test MCP tool", nil, func(ctx context.Context, args json.RawMessage) (string, error) {
+		return "ok", nil
+	}, SourceMCP)
+
+	defs := r.DefinitionsForMode([]string{"read_file"})
+	names := map[string]bool{}
+	for _, def := range defs {
+		names[def.Function.Name] = true
+	}
+
+	if !names["read_file"] {
+		t.Fatal("read_file missing from explicit built-in allowlist")
+	}
+	if names["write_file"] {
+		t.Fatal("write_file should be filtered out by explicit built-in allowlist")
+	}
+	if !names["mcp_sidecar_job"] {
+		t.Fatal("MCP tool should remain visible when built-ins are filtered")
+	}
+}
+
+func TestDefinitionsForModeEmptyBuiltinAllowStillKeepsMCP(t *testing.T) {
+	r := NewRegistry("", "")
+	t.Cleanup(r.Close)
+	r.RegisterFrom("mcp_sidecar_job", "test MCP tool", nil, func(ctx context.Context, args json.RawMessage) (string, error) {
+		return "ok", nil
+	}, SourceMCP)
+
+	defs := r.DefinitionsForMode([]string{})
+	names := map[string]bool{}
+	for _, def := range defs {
+		names[def.Function.Name] = true
+	}
+
+	if names["web_fetch"] || names["write_file"] {
+		t.Fatalf("built-ins should be filtered out for empty allowlist: %#v", names)
+	}
+	if !names["mcp_sidecar_job"] {
+		t.Fatal("MCP tool should remain visible for empty built-in allowlist")
+	}
+}

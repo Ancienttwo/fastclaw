@@ -51,12 +51,17 @@ type Agent struct {
 	// dashboard reload silently drops the agent back to agent-mode prompt
 	// even after the operator explicitly chose chatbot/customize.
 	// PromptMode also drives the per-turn tool filter via
-	// builtinAllowForMode below.
+	// builtinAllowForAgent below.
 	promptMode string
-	homePath        string // agent's home: SOUL.md, sessions, memory, skills
-	workspacePath   string // working dir where agent creates user files
-	homeDir         string // FastClaw root, ~/.fastclaw
-	ownerUserID     string // the user that owns this agent (for hook namespacing)
+	// builtinTools optionally overrides the built-in tool surface. nil =
+	// inherit promptMode defaults; empty = no built-ins; non-empty = only
+	// those built-in names. MCP/plugin tools are still included by the
+	// registry filter.
+	builtinTools  []string
+	homePath      string // agent's home: SOUL.md, sessions, memory, skills
+	workspacePath string // working dir where agent creates user files
+	homeDir       string // FastClaw root, ~/.fastclaw
+	ownerUserID   string // the user that owns this agent (for hook namespacing)
 	// admins is the per-channel allowlist of chatters who can run write-
 	// mode slash commands (/new /undo /retry /compact /model /personality).
 	// Keyed by channel name (e.g. "discord" → ["123...", "456..."]). Empty
@@ -339,15 +344,16 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 		maxParallelToolCalls: rc.MaxParallelToolCalls,
 		thinking:             rc.Thinking,
 		promptMode:           rc.PromptMode,
-		homePath:        rc.Home,
-		workspacePath:   workspace,
-		homeDir:         homeDir,
-		admins:          rc.Admins,
-		skillsCfg:       rc.Skills,
-		globalSkillsCfg: globalSkillsCfg,
-		messageBus:      mb,
-		engine:          eng,
-		costTracker:     eng.costTracker,
+		builtinTools:         cloneStringSlice(rc.BuiltinTools),
+		homePath:             rc.Home,
+		workspacePath:        workspace,
+		homeDir:              homeDir,
+		admins:               rc.Admins,
+		skillsCfg:            rc.Skills,
+		globalSkillsCfg:      globalSkillsCfg,
+		messageBus:           mb,
+		engine:               eng,
+		costTracker:          eng.costTracker,
 	}
 
 	// Multi-bubble split-replies: per-agent only — system-level toggle
@@ -719,7 +725,23 @@ func (a *Agent) meterTokens(ctx context.Context, sessionKey string, u provider.U
 // HandleMessage path. Providers that don't actually stream still work
 // — they just deliver one big chunk on Done.
 func (a *Agent) streamChatToResponse(ctx context.Context, messages []provider.Message, tools []provider.Tool) (*provider.Response, error) {
-	sr, err := a.provider.ChatStream(ctx, messages, tools, a.model, a.maxTokens, a.temperature)
+	return a.streamChatToResponseWithOptions(ctx, messages, tools, provider.ChatOptions{})
+}
+
+func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []provider.Message, tools []provider.Tool, options provider.ChatOptions) (*provider.Response, error) {
+	var (
+		sr  *provider.StreamReader
+		err error
+	)
+	if options.ToolChoice != nil {
+		if optionProvider, ok := a.provider.(provider.OptionProvider); ok {
+			sr, err = optionProvider.ChatStreamWithOptions(ctx, messages, tools, a.model, a.maxTokens, a.temperature, options)
+		} else {
+			sr, err = a.provider.ChatStream(ctx, messages, tools, a.model, a.maxTokens, a.temperature)
+		}
+	} else {
+		sr, err = a.provider.ChatStream(ctx, messages, tools, a.model, a.maxTokens, a.temperature)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1294,6 +1316,446 @@ func renderClientParams(params map[string]any) string {
 		"```json\n" + string(blob) + "\n```"
 }
 
+type requiredToolSequencePolicy struct {
+	sequence         []string
+	next             int
+	noToolRetries    int
+	noToolRetryCount int
+}
+
+func requiredToolSequenceFromParams(params map[string]any, tools []provider.Tool) *requiredToolSequencePolicy {
+	if len(params) == 0 {
+		return nil
+	}
+	raw, ok := params["fastclaw_tool_policy"]
+	if !ok {
+		raw = params["fastclawToolPolicy"]
+	}
+	policy, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	rawSequence, ok := policy["required_sequence"]
+	if !ok {
+		rawSequence = policy["requiredSequence"]
+	}
+	sequence := stringList(rawSequence)
+	if len(sequence) == 0 {
+		return nil
+	}
+	retries := intFromPolicy(policy, "max_no_tool_retries", "maxNoToolRetries", 1)
+	return newRequiredToolSequencePolicy(sequence, retries)
+}
+
+func requiredToolSequenceFromText(text string, tools []provider.Tool) *requiredToolSequencePolicy {
+	payload := saleskoTaskPayloadFromText(text)
+	if len(payload) == 0 {
+		return nil
+	}
+	requiredTools, ok := payload["required_tools"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	names := []string{}
+	if first, ok := requiredTools["first_call"].(string); ok {
+		names = append(names, first)
+	}
+	if final, ok := requiredTools["final_call"].(string); ok && final != "" {
+		if len(names) == 0 || final != names[len(names)-1] {
+			names = append(names, final)
+		}
+	}
+	return newRequiredToolSequencePolicy(names, 2)
+}
+
+func newRequiredToolSequencePolicy(sequence []string, retries int) *requiredToolSequencePolicy {
+	if len(sequence) == 0 {
+		return nil
+	}
+	if retries < 0 {
+		retries = 0
+	}
+	if retries > 5 {
+		retries = 5
+	}
+	return &requiredToolSequencePolicy{sequence: sequence, noToolRetries: retries}
+}
+
+func (p *requiredToolSequencePolicy) nextTool() string {
+	if p == nil || p.next >= len(p.sequence) {
+		return ""
+	}
+	return p.sequence[p.next]
+}
+
+func (p *requiredToolSequencePolicy) complete() bool {
+	return p == nil || p.next >= len(p.sequence)
+}
+
+func (p *requiredToolSequencePolicy) markSuccessfulTool(name string) {
+	if p == nil || p.complete() {
+		return
+	}
+	if name == p.sequence[p.next] {
+		p.next++
+	}
+}
+
+func (p *requiredToolSequencePolicy) canRetryNoTool() bool {
+	return p != nil && !p.complete() && p.noToolRetryCount < p.noToolRetries
+}
+
+func (p *requiredToolSequencePolicy) noToolNudge() provider.Message {
+	p.noToolRetryCount++
+	next := p.nextTool()
+	return provider.Message{
+		Role: "system",
+		Content: "The previous response did not call the required tool. This turn is not complete. " +
+			"Call `" + next + "` now; do not answer in prose before the required tool call succeeds.",
+	}
+}
+
+func requiredToolChoiceMessage(toolName string) provider.Message {
+	return provider.Message{
+		Role: "system",
+		Content: "This turn has an app-owned required tool sequence that overrides generic planning or file-bootstrap instructions. " +
+			"Do not write todo.md and do not use file tools for this turn. The next required tool is `" +
+			toolName + "`. Call that tool now and do not produce a final answer before the required sequence is complete.",
+	}
+}
+
+func synthesizeRequiredToolCallOnNoTool(resp *provider.Response, policy *requiredToolSequencePolicy, params map[string]any, text string, messages []provider.Message, round int) bool {
+	if resp == nil || resp.HasToolCalls() || policy == nil || policy.complete() {
+		return false
+	}
+	tc, ok := requiredSyntheticToolCall(policy.nextTool(), params, text, messages, round)
+	if !ok {
+		return false
+	}
+	resp.Content = ""
+	resp.ToolCalls = []provider.ToolCall{tc}
+	resp.RawAssistant = nil
+	return true
+}
+
+func requiredSyntheticToolCall(toolName string, params map[string]any, text string, messages []provider.Message, round int) (provider.ToolCall, bool) {
+	args, ok := requiredSyntheticToolArgs(toolName, params, text, messages)
+	if !ok {
+		return provider.ToolCall{}, false
+	}
+	blob, err := json.Marshal(args)
+	if err != nil {
+		return provider.ToolCall{}, false
+	}
+	return provider.ToolCall{
+		ID:   fmt.Sprintf("required_%d_%s", round, strings.ReplaceAll(toolName, ".", "_")),
+		Type: "function",
+		Function: provider.FunctionCall{
+			Name:      toolName,
+			Arguments: string(blob),
+		},
+	}, true
+}
+
+func requiredSyntheticToolArgs(toolName string, params map[string]any, text string, messages []provider.Message) (map[string]any, bool) {
+	switch {
+	case strings.HasSuffix(toolName, "graph_read_job_context"):
+		return requiredSyntheticReadContextArgs(params, text)
+	case strings.HasSuffix(toolName, "graph_submit_proposal"):
+		return requiredSyntheticSubmitProposalArgs(params, text, messages)
+	default:
+		return nil, false
+	}
+}
+
+func requiredSyntheticReadContextArgs(params map[string]any, text string) (map[string]any, bool) {
+	payloadArgs := saleskoToolArgumentsFromText(text)
+	args := map[string]any{}
+	if value := firstStringArg(params, payloadArgs, "job_id", "salesko_job_id"); value != "" {
+		args["job_id"] = value
+	}
+	if value := firstStringArg(params, payloadArgs, "tenant_id"); value != "" {
+		args["tenant_id"] = value
+	}
+	if value := firstStringArg(params, payloadArgs, "dataset_scope"); value != "" {
+		args["dataset_scope"] = value
+	}
+	if value := firstStringArg(params, payloadArgs, "frame_record_id"); value != "" {
+		args["frame_record_id"] = value
+	}
+	if args["job_id"] == nil || args["tenant_id"] == nil || args["frame_record_id"] == nil {
+		return nil, false
+	}
+	return args, true
+}
+
+func requiredSyntheticSubmitProposalArgs(params map[string]any, text string, messages []provider.Message) (map[string]any, bool) {
+	payloadArgs := saleskoToolArgumentsFromText(text)
+	contextResult := lastRequiredReadContextResult(messages)
+	baseFrame, ok := mapArg(contextResult, "baseFrame")
+	if !ok {
+		return nil, false
+	}
+	targetNode, ok := targetNodeFromReadContext(contextResult)
+	if !ok {
+		return nil, false
+	}
+	jobID := firstStringArg(params, payloadArgs, "job_id", "salesko_job_id")
+	tenantID := firstStringArg(params, payloadArgs, "tenant_id")
+	frameRecordID := firstStringArg(params, payloadArgs, "frame_record_id")
+	if jobID == "" || tenantID == "" || frameRecordID == "" {
+		return nil, false
+	}
+	baseFrameVersion := firstPositiveIntArg(params, payloadArgs, "expected_frame_version", "base_frame_version")
+	if baseFrameVersion == 0 {
+		baseFrameVersion = positiveIntArg(contextResult, "currentFrameVersion")
+	}
+	if baseFrameVersion == 0 {
+		return nil, false
+	}
+	args := map[string]any{
+		"job_id":               jobID,
+		"tenant_id":            tenantID,
+		"base_frame_record_id": frameRecordID,
+		"base_frame_version":   baseFrameVersion,
+		"preview_frame":        baseFrame,
+		"proposed_change_set": map[string]any{
+			"clientMutationId": "fastclaw-required-submit:" + jobID,
+			"reason":           "Provider did not emit the required submit tool call; confirming bounded context without new public-source claims.",
+			"commands": []any{
+				map[string]any{
+					"type": "upsert_node",
+					"node": targetNode,
+				},
+			},
+		},
+		"evidence":    []any{},
+		"warnings":    []any{"public_source_tools_unavailable", "deterministic_submit_fallback_used"},
+		"stop_reason": "provider_limit",
+	}
+	if datasetScope := firstStringArg(params, payloadArgs, "dataset_scope"); datasetScope != "" {
+		args["dataset_scope"] = datasetScope
+	}
+	return args, true
+}
+
+func lastRequiredReadContextResult(messages []provider.Message) map[string]any {
+	for i := len(messages) - 1; i >= 0; i-- {
+		msg := messages[i]
+		if msg.Role != "tool" || !strings.HasSuffix(msg.Name, "graph_read_job_context") {
+			continue
+		}
+		var result map[string]any
+		if err := json.Unmarshal([]byte(msg.Content), &result); err != nil {
+			return nil
+		}
+		return result
+	}
+	return nil
+}
+
+func targetNodeFromReadContext(contextResult map[string]any) (map[string]any, bool) {
+	baseFrame, ok := mapArg(contextResult, "baseFrame")
+	if !ok {
+		return nil, false
+	}
+	graph, ok := mapArg(baseFrame, "graph")
+	if !ok {
+		return nil, false
+	}
+	nodes, ok := graph["nodes"].([]any)
+	if !ok || len(nodes) == 0 {
+		return nil, false
+	}
+	if target, ok := mapArg(contextResult, "targetEntity"); ok {
+		if latestNodeID := stringArg(target, "latestNodeId"); latestNodeID != "" {
+			if node, ok := findNodeByID(nodes, latestNodeID); ok {
+				return node, true
+			}
+		}
+		if canonicalID := stringArg(target, "id"); canonicalID != "" {
+			if node, ok := findNodeByCanonicalID(nodes, canonicalID); ok {
+				return node, true
+			}
+		}
+	}
+	node, ok := nodes[0].(map[string]any)
+	return node, ok
+}
+
+func findNodeByID(nodes []any, id string) (map[string]any, bool) {
+	for _, raw := range nodes {
+		node, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if stringArg(node, "id") == id {
+			return node, true
+		}
+	}
+	return nil, false
+}
+
+func findNodeByCanonicalID(nodes []any, canonicalID string) (map[string]any, bool) {
+	for _, raw := range nodes {
+		node, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		data, ok := mapArg(node, "data")
+		if !ok {
+			continue
+		}
+		if stringArg(data, "canonicalEntityId") == canonicalID {
+			return node, true
+		}
+	}
+	return nil, false
+}
+
+func mapArg(values map[string]any, key string) (map[string]any, bool) {
+	if len(values) == 0 {
+		return nil, false
+	}
+	value, ok := values[key].(map[string]any)
+	return value, ok
+}
+
+func firstStringArg(params map[string]any, payloadArgs map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := stringArg(params, key); value != "" {
+			return value
+		}
+	}
+	for _, key := range keys {
+		if value := stringArg(payloadArgs, key); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func stringArg(values map[string]any, key string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	value, ok := values[key].(string)
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(value)
+}
+
+func firstPositiveIntArg(params map[string]any, payloadArgs map[string]any, keys ...string) int {
+	for _, key := range keys {
+		if value := positiveIntArg(params, key); value > 0 {
+			return value
+		}
+	}
+	for _, key := range keys {
+		if value := positiveIntArg(payloadArgs, key); value > 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+func positiveIntArg(values map[string]any, key string) int {
+	if len(values) == 0 {
+		return 0
+	}
+	switch value := values[key].(type) {
+	case int:
+		if value > 0 {
+			return value
+		}
+	case float64:
+		if value > 0 && value == float64(int(value)) {
+			return int(value)
+		}
+	case json.Number:
+		if i, err := value.Int64(); err == nil && i > 0 {
+			return int(i)
+		}
+	}
+	return 0
+}
+
+func saleskoToolArgumentsFromText(text string) map[string]any {
+	payload := saleskoTaskPayloadFromText(text)
+	args, ok := payload["tool_arguments"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	return args
+}
+
+func saleskoTaskPayloadFromText(text string) map[string]any {
+	if strings.TrimSpace(text) == "" {
+		return nil
+	}
+	start := strings.Index(text, "{")
+	if start < 0 {
+		return nil
+	}
+	var payload map[string]any
+	decoder := json.NewDecoder(strings.NewReader(text[start:]))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return nil
+	}
+	return payload
+}
+
+func hasToolName(tools []provider.Tool, name string) bool {
+	for _, tool := range tools {
+		if tool.Function.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func stringList(value any) []string {
+	values, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		name, ok := value.(string)
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func intFromPolicy(policy map[string]any, snake, camel string, fallback int) int {
+	value, ok := policy[snake]
+	if !ok {
+		value, ok = policy[camel]
+	}
+	if !ok {
+		return fallback
+	}
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case json.Number:
+		if i, err := typed.Int64(); err == nil {
+			return int(i)
+		}
+	}
+	return fallback
+}
+
 // stripSenderPrefix removes the leading "\[name\]: " (or unescaped
 // "[name]: ") attribution wrapper that the agent loop injects on
 // IM-routed user turns. Used by the web history rendering so the
@@ -1693,7 +2155,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	// as if delegate_task / web_search / camoufox-cli didn't exist —
 	// which defeated the whole point of having Plan mode set up fan-out
 	// work for the execution turn.
-	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
+	toolDefs := a.registry.DefinitionsForMode(a.builtinAllow())
 	catalog := buildToolCatalogForPlan(toolDefs)
 	messages := []provider.Message{
 		{Role: "system", Content: systemPrompt},
@@ -1955,7 +2417,18 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	}
 	messages = append(messages, a.withMessageTimestamps(sessionMsgs)...)
 
-	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
+	toolDefs := a.registry.DefinitionsForMode(a.builtinAllow())
+	requiredToolPolicy := requiredToolSequenceFromParams(msg.Params, toolDefs)
+	if requiredToolPolicy == nil {
+		requiredToolPolicy = requiredToolSequenceFromText(msg.Text, toolDefs)
+	}
+	if requiredToolPolicy != nil {
+		slog.Info("required tool sequence active",
+			"agent", a.name,
+			"sequence", strings.Join(requiredToolPolicy.sequence, ","),
+			"no_tool_retries", requiredToolPolicy.noToolRetries,
+		)
+	}
 
 	// Loop detection: track consecutive identical tool calls
 	type toolCallSig struct {
@@ -2028,8 +2501,17 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				),
 			})
 		}
+		chatOptions := provider.ChatOptions{}
+		if callTools != nil && requiredToolPolicy != nil {
+			if nextTool := requiredToolPolicy.nextTool(); nextTool != "" {
+				if hasToolName(callTools, nextTool) {
+					chatOptions.ToolChoice = &provider.ToolChoice{Name: nextTool}
+				}
+				llmMessages = append(llmMessages, requiredToolChoiceMessage(nextTool))
+			}
+		}
 		dumpLLMRequest(a.name, a.model, llmMessages, callTools)
-		resp, err := a.streamChatToResponse(ctx, llmMessages, callTools)
+		resp, err := a.streamChatToResponseWithOptions(ctx, llmMessages, callTools, chatOptions)
 
 		// Hook: AfterModelCall
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
@@ -2044,7 +2526,28 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		a.meterTokens(ctx, sess.Key(), resp.Usage, 0)
 		a.maybeRecoverToolCalls(resp)
 
+		if !resp.HasToolCalls() && synthesizeRequiredToolCallOnNoTool(resp, requiredToolPolicy, msg.Params, msg.Text, messages, i+1) {
+			slog.Warn("synthesized required tool call after no-tool response",
+				"agent", a.name,
+				"tool", resp.ToolCalls[0].Function.Name,
+				"iteration", i+1,
+			)
+		}
+
 		if !resp.HasToolCalls() {
+			if requiredToolPolicy.canRetryNoTool() {
+				if resp.Content != "" {
+					messages = append(messages, provider.Message{
+						Role:         "assistant",
+						Content:      resp.Content,
+						Thinking:     resp.Thinking,
+						Timestamp:    time.Now().UnixMilli(),
+						RawAssistant: resp.RawAssistant,
+					})
+				}
+				messages = append(messages, requiredToolPolicy.noToolNudge())
+				continue
+			}
 			asst := provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
 			sess.Append(asst)
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content}})
@@ -2259,6 +2762,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				// One call in this round produced a real result —
 				// the round as a whole isn't "all failed".
 				roundAllFailed = false
+				requiredToolPolicy.markSuccessfulTool(r.toolName)
 			}
 
 			// Index in FTS if available
@@ -2661,7 +3165,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	}
 	messages = append(messages, a.withMessageTimestamps(sessionMsgs)...)
 
-	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
+	toolDefs := a.registry.DefinitionsForMode(a.builtinAllow())
 
 	type toolCallSig struct {
 		name string
@@ -3026,20 +3530,20 @@ func (a *Agent) RegisteredTools() []tools.ToolInfo {
 // support / role-play products:
 //
 //   - image_gen     : self-generated images (registered only if a
-//                     provider is configured; absence is fine)
+//     provider is configured; absence is fine)
 //   - tts           : voice messages (same conditional registration)
 //   - write_file    : persist USER.md / MEMORY.md when the LLM learns
-//                     something worth keeping. Routing in
-//                     systemFileUserID sends USER.md/MEMORY.md to the
-//                     per-chatter row, so each chatter accrues their
-//                     own profile / memory. Path resolution rejects
-//                     arbitrary paths via identityFileBlocked +
-//                     workspace scoping, so this isn't a general
-//                     "let the chatbot write anywhere" hole — just
-//                     the canonical per-chatter notes.
+//     something worth keeping. Routing in
+//     systemFileUserID sends USER.md/MEMORY.md to the
+//     per-chatter row, so each chatter accrues their
+//     own profile / memory. Path resolution rejects
+//     arbitrary paths via identityFileBlocked +
+//     workspace scoping, so this isn't a general
+//     "let the chatbot write anywhere" hole — just
+//     the canonical per-chatter notes.
 //   - edit_file     : same rationale; preferred over write_file when
-//                     surgically updating MEMORY.md so the model
-//                     doesn't accidentally clobber prior entries.
+//     surgically updating MEMORY.md so the model
+//     doesn't accidentally clobber prior entries.
 //
 // Notably absent: `read_file` / `list_dir` — chatbot mode shouldn't
 // browse the filesystem; USER.md / MEMORY.md content is already loaded
@@ -3099,6 +3603,26 @@ func builtinAllowForMode(mode string) []string {
 	default: // agent (or empty/unknown — defaults to agent for back-compat)
 		return nil // nil = all built-ins exposed
 	}
+}
+
+func builtinAllowForAgent(mode string, override []string) []string {
+	if override != nil {
+		return override
+	}
+	return builtinAllowForMode(mode)
+}
+
+func cloneStringSlice(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+func (a *Agent) builtinAllow() []string {
+	return builtinAllowForAgent(a.promptMode, a.builtinTools)
 }
 
 // WorkspacePath returns the agent's working directory for user-facing files.
@@ -3177,10 +3701,11 @@ func (a *Agent) UpdateConfig(rc config.ResolvedAgent) {
 	// Propagate per-agent prompt mode updates from dashboard saves.
 	// Without this, an operator switching an agent to chatbot mode in
 	// the UI would have to restart the binary for the change to take
-	// effect. The tool filter follows promptMode automatically via
-	// builtinAllowForMode at request time, so no separate hot-reload
-	// hook is needed for the tool surface.
+	// effect. The tool filter reads promptMode plus any builtinTools
+	// override at request time, so no separate hot-reload hook is
+	// needed for the tool surface.
 	a.promptMode = rc.PromptMode
+	a.builtinTools = cloneStringSlice(rc.BuiltinTools)
 	a.ctxBuilder.SetPromptMode(rc.PromptMode)
 	// Per-agent WeChat split-replies. Nil override = keep whatever the
 	// system layer initialized at boot (don't reset to false). Non-nil

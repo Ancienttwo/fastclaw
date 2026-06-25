@@ -37,6 +37,42 @@ var identityFiles = map[string]bool{
 	"agent.json":   true,
 }
 
+var knownBuiltinToolNames = map[string]struct{}{
+	"app_preview_logs":  {},
+	"apply_patch":       {},
+	"bash_output":       {},
+	"create_cron_job":   {},
+	"delegate_task":     {},
+	"delete_cron_job":   {},
+	"edit_file":         {},
+	"exec":              {},
+	"image_gen":         {},
+	"kill_shell":        {},
+	"list_cron_jobs":    {},
+	"list_dir":          {},
+	"load_skill":        {},
+	"memory_search":     {},
+	"message":           {},
+	"read_file":         {},
+	"set_preference":    {},
+	"set_timezone":      {},
+	"spawn_subagent":    {},
+	"start_app_preview": {},
+	"tts":               {},
+	"update_goal":       {},
+	"web_fetch":         {},
+	"web_search":        {},
+	"write_file":        {},
+}
+
+// IsKnownBuiltinToolName reports whether name is a built-in tool FastClaw can
+// register. Some are registered only after optional runtime/provider wiring,
+// so this intentionally covers more names than a bare NewRegistry exposes.
+func IsKnownBuiltinToolName(name string) bool {
+	_, ok := knownBuiltinToolNames[name]
+	return ok
+}
+
 // isIdentityFilePath reports whether path refers to one of the
 // agent's private identity files. Matches in two shapes:
 //
@@ -762,9 +798,9 @@ func (r *Registry) RegisteredTools() []ToolInfo {
 // operators extend a chatbot beyond the built-in IM primitives, and
 // gating them by mode would defeat that. Only built-ins are filtered:
 //
-//   builtinAllow == nil       → all built-ins included (agent mode)
-//   builtinAllow == []string{} → no built-ins included (customize mode)
-//   builtinAllow == ["a","b"]  → only those built-ins (chatbot mode)
+//	builtinAllow == nil       → all built-ins included (agent mode)
+//	builtinAllow == []string{} → no built-ins included (customize mode)
+//	builtinAllow == ["a","b"]  → only those built-ins (chatbot mode)
 //
 // The agent loop computes builtinAllow from PromptMode via the helper
 // in loop.go; this method just executes the filter.

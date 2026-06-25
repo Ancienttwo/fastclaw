@@ -674,12 +674,14 @@ var agentScopeKeys = map[string]string{
 	"thinking":             "agents.defaults",
 	"policy":               "agents.defaults",
 	// promptMode selects which framework sections BuildSystemPromptAs
-	// emits AND which built-in tools the LLM sees. One of "agent",
+	// emits AND the default built-in tool surface. One of "agent",
 	// "chatbot", "customize". Stored as a plain string under
-	// agents.defaults.promptMode. The built-in tool set per mode is
-	// hardcoded in builtinAllowForMode (internal/agent/loop.go) —
-	// custom tools come from Plugin / MCP, not a per-agent allowlist.
+	// agents.defaults.promptMode.
 	"promptMode": "agents.defaults",
+	// builtinTools optionally narrows the built-in tool surface. nil/
+	// absent = inherit promptMode defaults; [] = no built-ins; list =
+	// only those built-ins. Plugin / MCP tools always remain visible.
+	"builtinTools": "agents.defaults",
 	// splitReplies — per-agent multi-bubble toggle. When true, the
 	// dispatcher splits the reply at SplitMessageMarker before sending
 	// to any IM channel (WeChat / Telegram / Discord / Slack / LINE /
@@ -709,7 +711,7 @@ var systemSettingNamespaces = []string{
 // Agent-scope keys cover model/temperature/sandbox; everything else is
 // a system-wide namespace. The bool return is "isAgentScope" — true
 // means the row's agent_id should be set to the active agentID; false
-// means a system row (user_id='', agent_id='').
+// means a system row with empty user and agent ids.
 func settingKey(key string) (string, []string, bool, error) {
 	if ns, ok := agentScopeKeys[key]; ok {
 		path := []string{key}

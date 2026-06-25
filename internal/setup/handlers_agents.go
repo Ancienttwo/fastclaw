@@ -163,6 +163,66 @@ func (s *Server) agentScopePromptMode(r *http.Request, agentID string) string {
 	return ""
 }
 
+func stringSliceFromConfig(v interface{}) ([]string, bool) {
+	switch vv := v.(type) {
+	case []string:
+		out := make([]string, len(vv))
+		copy(out, vv)
+		return out, true
+	case []interface{}:
+		out := make([]string, 0, len(vv))
+		for _, item := range vv {
+			s, ok := item.(string)
+			if !ok {
+				return nil, false
+			}
+			out = append(out, s)
+		}
+		return out, true
+	default:
+		return nil, false
+	}
+}
+
+// agentScopeBuiltinTools reads the per-agent built-in tool override. nil
+// means no override (runtime inherits promptMode defaults); an explicit empty
+// slice means "no built-ins".
+func (s *Server) agentScopeBuiltinTools(r *http.Request, agentID string) []string {
+	rec, err := s.dataStore.GetConfigByName(r.Context(), store.KindSetting, "", agentID, "agents.defaults")
+	if err != nil || rec == nil {
+		return nil
+	}
+	v, ok := rec.Data["builtinTools"]
+	if !ok {
+		return nil
+	}
+	out, ok := stringSliceFromConfig(v)
+	if !ok {
+		return nil
+	}
+	return out
+}
+
+func sanitizeBuiltinToolNames(raw []string) ([]string, error) {
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, item := range raw {
+		name := strings.TrimSpace(item)
+		if name == "" {
+			return nil, fmt.Errorf("builtinTools entries must be non-empty strings")
+		}
+		if !tools.IsKnownBuiltinToolName(name) {
+			return nil, fmt.Errorf("builtinTools contains unknown built-in tool %q", name)
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+	return out, nil
+}
+
 // agentScopePlugins reads the per-agent plugin enable overlay. Returns
 // nil when no row exists. Keyed pluginID → bool; missing keys fall
 // through to the system-wide plugin entry's enabled state.
@@ -460,18 +520,24 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name              string    `json:"name,omitempty"`
-		Description       *string   `json:"description,omitempty"` // ptr so empty-string clears it
-		Model             *string   `json:"model,omitempty"`       // ptr so empty-string clears the agent-scope override
-		IsPublic          *bool     `json:"isPublic,omitempty"`    // ptr so caller can leave it unchanged
-		ShareModelConfig  *bool     `json:"shareModelConfig,omitempty"`
+		Name             string  `json:"name,omitempty"`
+		Description      *string `json:"description,omitempty"` // ptr so empty-string clears it
+		Model            *string `json:"model,omitempty"`       // ptr so empty-string clears the agent-scope override
+		IsPublic         *bool   `json:"isPublic,omitempty"`    // ptr so caller can leave it unchanged
+		ShareModelConfig *bool   `json:"shareModelConfig,omitempty"`
 		// PromptMode is a ptr so the caller can distinguish "leave
 		// unchanged" (omitted / null) from "clear override" (empty
 		// string). Allowed string values: "agent" | "chatbot" |
 		// "customize" — empty falls back to system default ("agent").
-		// PromptMode also drives the built-in tool surface; there is
-		// no separate allowlist field by design (extend via plugins).
+		// PromptMode also drives the default built-in tool surface unless
+		// builtinTools is set.
 		PromptMode *string `json:"promptMode,omitempty"`
+		// BuiltinTools optionally narrows the built-in tool surface:
+		// nil/omitted = leave unchanged; [] = no built-ins; non-empty =
+		// only those built-ins. MCP/plugin tools are not filtered by this
+		// field. builtinToolsReset deletes the override.
+		BuiltinTools      *[]string `json:"builtinTools,omitempty"`
+		BuiltinToolsReset bool      `json:"builtinToolsReset,omitempty"`
 		// SplitReplies per-agent override: nil = leave unchanged,
 		// non-nil pointer-to-bool = set explicit value (true/false).
 		// Distinct from "clear" which is a separate signal — the
@@ -583,6 +649,16 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.BuiltinToolsReset {
+		defaultsPatch["builtinTools"] = nil
+	} else if req.BuiltinTools != nil {
+		names, err := sanitizeBuiltinToolNames(*req.BuiltinTools)
+		if err != nil {
+			jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		defaultsPatch["builtinTools"] = names
+	}
 	if req.SplitRepliesReset {
 		// Reset wins over set in the same request — the dashboard's
 		// "Inherit" pill writes this flag.
@@ -622,6 +698,7 @@ func (s *Server) handleUpdateAgent(w http.ResponseWriter, r *http.Request) {
 			"name":             rec.Name,
 			"model":            s.agentScopeModel(r, rec.ID),
 			"promptMode":       s.agentScopePromptMode(r, rec.ID),
+			"builtinTools":     s.agentScopeBuiltinTools(r, rec.ID),
 			"splitReplies":     s.agentScopeSplitReplies(r, rec.ID),
 			"autoPersist":      s.agentScopeAutoPersist(r, rec.ID),
 			"plugins":          s.agentScopePlugins(r, rec.ID),
@@ -662,6 +739,7 @@ func (s *Server) handleGetAgent(w http.ResponseWriter, r *http.Request) {
 			"role":             role,
 			"model":            s.agentScopeModel(r, rec.ID),
 			"promptMode":       s.agentScopePromptMode(r, rec.ID),
+			"builtinTools":     s.agentScopeBuiltinTools(r, rec.ID),
 			"splitReplies":     s.agentScopeSplitReplies(r, rec.ID),
 			"autoPersist":      s.agentScopeAutoPersist(r, rec.ID),
 			"plugins":          s.agentScopePlugins(r, rec.ID),
@@ -964,15 +1042,15 @@ func (s *Server) handleAgentFileList(w http.ResponseWriter, r *http.Request) {
 // file browser / zip filter. acceptPath returns true for paths the
 // scope considers in-bounds:
 //
-//   loose chat:  paths under sessions/<chat_id>/
-//   project chat: paths under projects/<pid>/<chat_id>/ (the chat's
-//                 own files), PLUS files directly at projects/<pid>/
-//                 (project-root "shared/legacy" files — pre-subdir
-//                 layout still lives there, and operators may
-//                 deliberately drop shared files at the root). Other
-//                 chats' subdirs (projects/<pid>/<other-sid>/...)
-//                 are excluded — those belong to that chat's panel.
-//   no session:  everything (admin browser).
+//	loose chat:  paths under sessions/<chat_id>/
+//	project chat: paths under projects/<pid>/<chat_id>/ (the chat's
+//	              own files), PLUS files directly at projects/<pid>/
+//	              (project-root "shared/legacy" files — pre-subdir
+//	              layout still lives there, and operators may
+//	              deliberately drop shared files at the root). Other
+//	              chats' subdirs (projects/<pid>/<other-sid>/...)
+//	              are excluded — those belong to that chat's panel.
+//	no session:  everything (admin browser).
 //
 // archiveSuffix returns the human-readable scope id used in the zip
 // filename — chat_id for loose chats, "<pid>-<chat_id>" for project
