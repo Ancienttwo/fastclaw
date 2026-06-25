@@ -141,7 +141,7 @@ table and is edited through the dashboard or `fastclaw agents config`.
 - Thinking/reasoning content preserved for memory extraction
 
 ### API
-- OpenAI-compatible `/v1/chat/completions` (streaming)
+- OpenAI-compatible `/v1/chat/completions` (streaming, non-streaming, or `Prefer: respond-async` accepted JSON for upstream SaaS dispatch)
 - Web chat `/api/chat/stream` (SSE)
 - Live agent push via `/api/chat/subscribe` (SSE) — surfaces cron-fired and other async replies into the open chat panel without a refresh
 - Session management `/api/chat/sessions`

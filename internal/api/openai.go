@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
+	"github.com/fastclaw-ai/fastclaw/internal/users"
 )
 
 // chatCompletionRequest mirrors the OpenAI chat completion request.
@@ -160,6 +162,16 @@ type completionUsage struct {
 	TotalTokens      int `json:"total_tokens"`
 }
 
+// chatCompletionAcceptedResponse is returned for Prefer: respond-async.
+type chatCompletionAcceptedResponse struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	Created int64  `json:"created"`
+	Model   string `json:"model"`
+}
+
+const asyncChatCompletionTimeout = 15 * time.Minute
+
 // HandleChatCompletions handles POST /v1/chat/completions.
 func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var req chatCompletionRequest
@@ -208,7 +220,7 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.AgentID != "" {
 		agentID = req.AgentID
 	}
-	ag := resolveAgent(space, agentID)
+	ag := s.resolveRequestAgent(r, space, agentID)
 	if ag == nil {
 		writeJSON(w, http.StatusNotFound, map[string]any{
 			"error": map[string]string{"message": "agent not found", "type": "not_found_error"},
@@ -253,30 +265,6 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Materialize attached images into the agent's session workspace and
-	// prepend the same `[Attached: /workspace/<file>]` breadcrumb the web
-	// UI uses (web/src/app/agents/[id]/chat/page.tsx:639-645) so the wire
-	// shape is identical across web and API entry points. Verbose "do not
-	// probe" notes here actively backfire — models reflexively run
-	// which/ls/file to "verify" the path when the prompt foregrounds it.
-	// PhotoURLs is preserved so vision LLMs still see the image inline.
-	// API clients can't address a project today — chat completions only
-	// know session_key — so attachments always land in the loose-chat
-	// scope. When/if we expose project addressing here, look up the
-	// session row and pass its project_id instead of "".
-	atts := req.allAttachments()
-	attachmentPaths := ag.WriteSessionAttachments(r.Context(), sessionKey, "", atts)
-	if len(attachmentPaths) > 0 {
-		var b strings.Builder
-		for _, p := range attachmentPaths {
-			b.WriteString("[Attached: /workspace/")
-			b.WriteString(p)
-			b.WriteString("]\n")
-		}
-		b.WriteString(userText)
-		userText = b.String()
-	}
-
 	// Build inbound message.
 	// X-Fastclaw-Channel lets callers override the reply channel so
 	// cron jobs created during this turn route through the right
@@ -285,14 +273,40 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if channel == "" {
 		channel = "api"
 	}
-	msg := bus.InboundMessage{
-		Channel:   channel,
-		ChatID:    sessionKey,
-		UserID:    "api-user",
-		Text:      userText,
-		PeerKind:  "dm",
-		Params:    req.Params,
-		PhotoURLs: req.inlineImageURLs(),
+	buildMessage := func(ctx context.Context) bus.InboundMessage {
+		text := userText
+		// Materialize attached images into the agent's session workspace and
+		// prepend the same `[Attached: /workspace/<file>]` breadcrumb the web
+		// UI uses (web/src/app/agents/[id]/chat/page.tsx:639-645) so the wire
+		// shape is identical across web and API entry points. Verbose "do not
+		// probe" notes here actively backfire — models reflexively run
+		// which/ls/file to "verify" the path when the prompt foregrounds it.
+		// PhotoURLs is preserved so vision LLMs still see the image inline.
+		// API clients can't address a project today — chat completions only
+		// know session_key — so attachments always land in the loose-chat
+		// scope. When/if we expose project addressing here, look up the
+		// session row and pass its project_id instead of "".
+		attachmentPaths := ag.WriteSessionAttachments(ctx, sessionKey, "", req.allAttachments())
+		if len(attachmentPaths) > 0 {
+			var b strings.Builder
+			for _, p := range attachmentPaths {
+				b.WriteString("[Attached: /workspace/")
+				b.WriteString(p)
+				b.WriteString("]\n")
+			}
+			b.WriteString(text)
+			text = b.String()
+		}
+
+		return bus.InboundMessage{
+			Channel:   channel,
+			ChatID:    sessionKey,
+			UserID:    "api-user",
+			Text:      text,
+			PeerKind:  "dm",
+			Params:    req.Params,
+			PhotoURLs: req.inlineImageURLs(),
+		}
 	}
 
 	slog.Info("chat completion request",
@@ -308,6 +322,23 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	chatID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	now := time.Now().Unix()
 
+	if wantsAsyncChatCompletion(r) {
+		agentCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), asyncChatCompletionTimeout)
+		go func() {
+			defer cancel()
+			reply := ag.HandleMessage(agentCtx, buildMessage(agentCtx))
+			slog.Info("async chat completion finished",
+				"agent", ag.Name(),
+				"session", sessionKey,
+				"chat_id", chatID,
+				"reply_len", len(reply),
+			)
+		}()
+		s.acceptedResponse(w, chatID, model, now)
+		return
+	}
+
+	msg := buildMessage(r.Context())
 	isStream := req.Stream != nil && *req.Stream
 	if isStream {
 		s.streamResponseFromAgent(w, r, ag, msg, chatID, model, now)
@@ -316,6 +347,26 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		reply := ag.HandleMessage(r.Context(), msg)
 		s.fullResponse(w, reply, chatID, model, now)
 	}
+}
+
+func wantsAsyncChatCompletion(r *http.Request) bool {
+	for _, value := range r.Header.Values("Prefer") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(token), "respond-async") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *Server) acceptedResponse(w http.ResponseWriter, chatID, model string, created int64) {
+	writeJSON(w, http.StatusAccepted, chatCompletionAcceptedResponse{
+		ID:      chatID,
+		Object:  "chat.completion.accepted",
+		Created: created,
+		Model:   model,
+	})
 }
 
 func (s *Server) streamResponseFromAgent(w http.ResponseWriter, r *http.Request, ag *agent.Agent, msg bus.InboundMessage, chatID, model string, created int64) {
@@ -421,3 +472,25 @@ func resolveAgent(space *UserSpaceView, agentID string) *agent.Agent {
 	return nil
 }
 
+func (s *Server) resolveRequestAgent(r *http.Request, space *UserSpaceView, agentID string) *agent.Agent {
+	ag := resolveAgent(space, agentID)
+	if ag != nil || agentID == "" {
+		return ag
+	}
+	ident, ok := auth.FromContext(r.Context())
+	if !ok || !ident.CanAccessAgent(agentID) {
+		return nil
+	}
+	injector, ok := s.resolver.(AgentInjector)
+	if !ok {
+		return nil
+	}
+	if ident.AuthMethod != "apikey" && ident.Role != users.RoleSuperAdmin {
+		return nil
+	}
+	if err := injector.EnsureAgent(r.Context(), ident.EffectiveUserID(), agentID); err != nil {
+		slog.Warn("failed to attach agent for chat completion", "agent_id", agentID, "user_id", ident.EffectiveUserID(), "error", err)
+		return nil
+	}
+	return space.Agents.AgentByID(agentID)
+}
