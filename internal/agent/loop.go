@@ -1324,7 +1324,7 @@ type requiredToolSequencePolicy struct {
 }
 
 func requiredToolSequenceFromParams(params map[string]any, tools []provider.Tool) *requiredToolSequencePolicy {
-	if len(params) == 0 || len(tools) == 0 {
+	if len(params) == 0 {
 		return nil
 	}
 	raw, ok := params["fastclaw_tool_policy"]
@@ -1339,7 +1339,7 @@ func requiredToolSequenceFromParams(params map[string]any, tools []provider.Tool
 	if !ok {
 		rawSequence = policy["requiredSequence"]
 	}
-	sequence := availableToolSequence(stringList(rawSequence), tools)
+	sequence := stringList(rawSequence)
 	if len(sequence) == 0 {
 		return nil
 	}
@@ -1348,7 +1348,7 @@ func requiredToolSequenceFromParams(params map[string]any, tools []provider.Tool
 }
 
 func requiredToolSequenceFromText(text string, tools []provider.Tool) *requiredToolSequencePolicy {
-	if strings.TrimSpace(text) == "" || len(tools) == 0 {
+	if strings.TrimSpace(text) == "" {
 		return nil
 	}
 	start := strings.Index(text, "{")
@@ -1374,27 +1374,7 @@ func requiredToolSequenceFromText(text string, tools []provider.Tool) *requiredT
 			names = append(names, final)
 		}
 	}
-	sequence := availableToolSequence(names, tools)
-	if len(sequence) == 0 {
-		return nil
-	}
-	return newRequiredToolSequencePolicy(sequence, 2)
-}
-
-func availableToolSequence(names []string, tools []provider.Tool) []string {
-	available := make(map[string]struct{}, len(tools))
-	for _, tool := range tools {
-		if tool.Function.Name != "" {
-			available[tool.Function.Name] = struct{}{}
-		}
-	}
-	sequence := make([]string, 0, 4)
-	for _, name := range names {
-		if _, ok := available[name]; ok {
-			sequence = append(sequence, name)
-		}
-	}
-	return sequence
+	return newRequiredToolSequencePolicy(names, 2)
 }
 
 func newRequiredToolSequencePolicy(sequence []string, retries int) *requiredToolSequencePolicy {
@@ -1451,6 +1431,15 @@ func requiredToolChoiceMessage(toolName string) provider.Message {
 			"Do not write todo.md and do not use file tools for this turn. The next required tool is `" +
 			toolName + "`. Call that tool now and do not produce a final answer before the required sequence is complete.",
 	}
+}
+
+func hasToolName(tools []provider.Tool, name string) bool {
+	for _, tool := range tools {
+		if tool.Function.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func stringList(value any) []string {
@@ -2159,6 +2148,13 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	if requiredToolPolicy == nil {
 		requiredToolPolicy = requiredToolSequenceFromText(msg.Text, toolDefs)
 	}
+	if requiredToolPolicy != nil {
+		slog.Info("required tool sequence active",
+			"agent", a.name,
+			"sequence", strings.Join(requiredToolPolicy.sequence, ","),
+			"no_tool_retries", requiredToolPolicy.noToolRetries,
+		)
+	}
 
 	// Loop detection: track consecutive identical tool calls
 	type toolCallSig struct {
@@ -2234,7 +2230,9 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		chatOptions := provider.ChatOptions{}
 		if callTools != nil && requiredToolPolicy != nil {
 			if nextTool := requiredToolPolicy.nextTool(); nextTool != "" {
-				chatOptions.ToolChoice = &provider.ToolChoice{Name: nextTool}
+				if hasToolName(callTools, nextTool) {
+					chatOptions.ToolChoice = &provider.ToolChoice{Name: nextTool}
+				}
 				llmMessages = append(llmMessages, requiredToolChoiceMessage(nextTool))
 			}
 		}
