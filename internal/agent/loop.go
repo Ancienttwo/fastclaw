@@ -1339,6 +1339,49 @@ func requiredToolSequenceFromParams(params map[string]any, tools []provider.Tool
 	if !ok {
 		rawSequence = policy["requiredSequence"]
 	}
+	sequence := availableToolSequence(stringList(rawSequence), tools)
+	if len(sequence) == 0 {
+		return nil
+	}
+	retries := intFromPolicy(policy, "max_no_tool_retries", "maxNoToolRetries", 1)
+	return newRequiredToolSequencePolicy(sequence, retries)
+}
+
+func requiredToolSequenceFromText(text string, tools []provider.Tool) *requiredToolSequencePolicy {
+	if strings.TrimSpace(text) == "" || len(tools) == 0 {
+		return nil
+	}
+	start := strings.Index(text, "{")
+	if start < 0 {
+		return nil
+	}
+	var payload map[string]any
+	decoder := json.NewDecoder(strings.NewReader(text[start:]))
+	decoder.UseNumber()
+	if err := decoder.Decode(&payload); err != nil {
+		return nil
+	}
+	requiredTools, ok := payload["required_tools"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	names := []string{}
+	if first, ok := requiredTools["first_call"].(string); ok {
+		names = append(names, first)
+	}
+	if final, ok := requiredTools["final_call"].(string); ok && final != "" {
+		if len(names) == 0 || final != names[len(names)-1] {
+			names = append(names, final)
+		}
+	}
+	sequence := availableToolSequence(names, tools)
+	if len(sequence) == 0 {
+		return nil
+	}
+	return newRequiredToolSequencePolicy(sequence, 2)
+}
+
+func availableToolSequence(names []string, tools []provider.Tool) []string {
 	available := make(map[string]struct{}, len(tools))
 	for _, tool := range tools {
 		if tool.Function.Name != "" {
@@ -1346,15 +1389,18 @@ func requiredToolSequenceFromParams(params map[string]any, tools []provider.Tool
 		}
 	}
 	sequence := make([]string, 0, 4)
-	for _, name := range stringList(rawSequence) {
+	for _, name := range names {
 		if _, ok := available[name]; ok {
 			sequence = append(sequence, name)
 		}
 	}
+	return sequence
+}
+
+func newRequiredToolSequencePolicy(sequence []string, retries int) *requiredToolSequencePolicy {
 	if len(sequence) == 0 {
 		return nil
 	}
-	retries := intFromPolicy(policy, "max_no_tool_retries", "maxNoToolRetries", 1)
 	if retries < 0 {
 		retries = 0
 	}
@@ -1401,7 +1447,8 @@ func (p *requiredToolSequencePolicy) noToolNudge() provider.Message {
 func requiredToolChoiceMessage(toolName string) provider.Message {
 	return provider.Message{
 		Role: "system",
-		Content: "This turn has an app-owned required tool sequence. The next required tool is `" +
+		Content: "This turn has an app-owned required tool sequence that overrides generic planning or file-bootstrap instructions. " +
+			"Do not write todo.md and do not use file tools for this turn. The next required tool is `" +
 			toolName + "`. Call that tool now and do not produce a final answer before the required sequence is complete.",
 	}
 }
@@ -2109,6 +2156,9 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 
 	toolDefs := a.registry.DefinitionsForMode(a.builtinAllow())
 	requiredToolPolicy := requiredToolSequenceFromParams(msg.Params, toolDefs)
+	if requiredToolPolicy == nil {
+		requiredToolPolicy = requiredToolSequenceFromText(msg.Text, toolDefs)
+	}
 
 	// Loop detection: track consecutive identical tool calls
 	type toolCallSig struct {
