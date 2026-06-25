@@ -304,9 +304,17 @@ func TestSetGetConfigAgentScope(t *testing.T) {
 	if err := SetConfig(context.Background(), st, res.Agent.ID, "sandbox.enabled", "true"); err != nil {
 		t.Fatalf("set sandbox.enabled: %v", err)
 	}
+	if err := SetConfig(context.Background(), st, res.Agent.ID, "builtinTools", `["web_fetch","web_search"]`); err != nil {
+		t.Fatalf("set builtinTools: %v", err)
+	}
 	temp, _ := GetConfig(context.Background(), st, res.Agent.ID, "temperature")
 	if got, ok := temp.(float64); !ok || got != 0.42 {
 		t.Fatalf("temperature round-trip: %#v", temp)
+	}
+	builtinTools, _ := GetConfig(context.Background(), st, res.Agent.ID, "builtinTools")
+	toolList, _ := builtinTools.([]interface{})
+	if len(toolList) != 2 || toolList[0] != "web_fetch" || toolList[1] != "web_search" {
+		t.Fatalf("builtinTools round-trip: %#v", builtinTools)
 	}
 	box, _ := GetConfig(context.Background(), st, res.Agent.ID, "sandbox")
 	m, _ := box.(map[string]interface{})
@@ -513,13 +521,14 @@ func TestParseValueTypes(t *testing.T) {
 
 func TestSettingKeyRouting(t *testing.T) {
 	cases := []struct {
-		key           string
-		ns            string
-		path          []string
+		key            string
+		ns             string
+		path           []string
 		wantAgentScope bool
 	}{
 		{"model", "agents.defaults", []string{"model"}, true},
 		{"temperature", "agents.defaults", []string{"temperature"}, true},
+		{"builtinTools", "agents.defaults", []string{"builtinTools"}, true},
 		{"sandbox", "sandbox", nil, true},
 		{"sandbox.enabled", "sandbox", []string{"enabled"}, true},
 		{"plugins", "plugins", nil, false},

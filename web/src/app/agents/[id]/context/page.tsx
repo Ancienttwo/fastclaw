@@ -148,8 +148,8 @@ export default function AgentContextPage() {
           <p className="text-sm text-muted-foreground mt-1">
             What the LLM sees for{" "}
             <strong>{agentName || "this agent"}</strong>. The prompt mode
-            picks both the framework prompt profile and the built-in tool
-            set. Custom tools come from plugins — always exposed
+	            picks both the framework prompt profile and the built-in tool
+	            set. Custom tools come from plugins or MCP — always exposed
             regardless of mode.
           </p>
         </div>
@@ -217,7 +217,7 @@ export default function AgentContextPage() {
             learns about the chatter. Memory is the USER.md / MEMORY.md
             sections inlined in the system prompt; no{" "}
             <code className="text-[10px]">memory_search</code> escape
-            hatch (it scans logs chatbot mode doesn't write, returns
+	            hatch (it scans logs chatbot mode does not write, returns
             empty, and confuses the model). Main reply emits as plain
             text, multi-bubble via the inline split marker. For
             companion / role-play / customer-support bots.
@@ -225,8 +225,8 @@ export default function AgentContextPage() {
           <div>
             <strong>Customize</strong> — only the date anchor + your
             bootstrap files; NO built-in tools. You write the system
-            prompt completely via SOUL.md / IDENTITY.md and bring tools
-            via plugins.
+	            prompt completely via SOUL.md / IDENTITY.md and bring tools
+	            via plugins or MCP.
           </div>
         </div>
         <div className="mt-4 pt-3 border-t border-border flex items-start gap-2 text-xs text-muted-foreground">

@@ -51,12 +51,17 @@ type Agent struct {
 	// dashboard reload silently drops the agent back to agent-mode prompt
 	// even after the operator explicitly chose chatbot/customize.
 	// PromptMode also drives the per-turn tool filter via
-	// builtinAllowForMode below.
+	// builtinAllowForAgent below.
 	promptMode string
-	homePath        string // agent's home: SOUL.md, sessions, memory, skills
-	workspacePath   string // working dir where agent creates user files
-	homeDir         string // FastClaw root, ~/.fastclaw
-	ownerUserID     string // the user that owns this agent (for hook namespacing)
+	// builtinTools optionally overrides the built-in tool surface. nil =
+	// inherit promptMode defaults; empty = no built-ins; non-empty = only
+	// those built-in names. MCP/plugin tools are still included by the
+	// registry filter.
+	builtinTools  []string
+	homePath      string // agent's home: SOUL.md, sessions, memory, skills
+	workspacePath string // working dir where agent creates user files
+	homeDir       string // FastClaw root, ~/.fastclaw
+	ownerUserID   string // the user that owns this agent (for hook namespacing)
 	// admins is the per-channel allowlist of chatters who can run write-
 	// mode slash commands (/new /undo /retry /compact /model /personality).
 	// Keyed by channel name (e.g. "discord" → ["123...", "456..."]). Empty
@@ -339,15 +344,16 @@ func NewAgentWithSkillsCfg(rc config.ResolvedAgent, prov provider.Provider, mb *
 		maxParallelToolCalls: rc.MaxParallelToolCalls,
 		thinking:             rc.Thinking,
 		promptMode:           rc.PromptMode,
-		homePath:        rc.Home,
-		workspacePath:   workspace,
-		homeDir:         homeDir,
-		admins:          rc.Admins,
-		skillsCfg:       rc.Skills,
-		globalSkillsCfg: globalSkillsCfg,
-		messageBus:      mb,
-		engine:          eng,
-		costTracker:     eng.costTracker,
+		builtinTools:         cloneStringSlice(rc.BuiltinTools),
+		homePath:             rc.Home,
+		workspacePath:        workspace,
+		homeDir:              homeDir,
+		admins:               rc.Admins,
+		skillsCfg:            rc.Skills,
+		globalSkillsCfg:      globalSkillsCfg,
+		messageBus:           mb,
+		engine:               eng,
+		costTracker:          eng.costTracker,
 	}
 
 	// Multi-bubble split-replies: per-agent only — system-level toggle
@@ -1693,7 +1699,7 @@ func (a *Agent) handlePlanMode(ctx context.Context, msg bus.InboundMessage) stri
 	// as if delegate_task / web_search / camoufox-cli didn't exist —
 	// which defeated the whole point of having Plan mode set up fan-out
 	// work for the execution turn.
-	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
+	toolDefs := a.registry.DefinitionsForMode(a.builtinAllow())
 	catalog := buildToolCatalogForPlan(toolDefs)
 	messages := []provider.Message{
 		{Role: "system", Content: systemPrompt},
@@ -1955,7 +1961,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	}
 	messages = append(messages, a.withMessageTimestamps(sessionMsgs)...)
 
-	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
+	toolDefs := a.registry.DefinitionsForMode(a.builtinAllow())
 
 	// Loop detection: track consecutive identical tool calls
 	type toolCallSig struct {
@@ -2661,7 +2667,7 @@ func (a *Agent) HandleMessageStream(ctx context.Context, msg bus.InboundMessage)
 	}
 	messages = append(messages, a.withMessageTimestamps(sessionMsgs)...)
 
-	toolDefs := a.registry.DefinitionsForMode(builtinAllowForMode(a.promptMode))
+	toolDefs := a.registry.DefinitionsForMode(a.builtinAllow())
 
 	type toolCallSig struct {
 		name string
@@ -3026,20 +3032,20 @@ func (a *Agent) RegisteredTools() []tools.ToolInfo {
 // support / role-play products:
 //
 //   - image_gen     : self-generated images (registered only if a
-//                     provider is configured; absence is fine)
+//     provider is configured; absence is fine)
 //   - tts           : voice messages (same conditional registration)
 //   - write_file    : persist USER.md / MEMORY.md when the LLM learns
-//                     something worth keeping. Routing in
-//                     systemFileUserID sends USER.md/MEMORY.md to the
-//                     per-chatter row, so each chatter accrues their
-//                     own profile / memory. Path resolution rejects
-//                     arbitrary paths via identityFileBlocked +
-//                     workspace scoping, so this isn't a general
-//                     "let the chatbot write anywhere" hole — just
-//                     the canonical per-chatter notes.
+//     something worth keeping. Routing in
+//     systemFileUserID sends USER.md/MEMORY.md to the
+//     per-chatter row, so each chatter accrues their
+//     own profile / memory. Path resolution rejects
+//     arbitrary paths via identityFileBlocked +
+//     workspace scoping, so this isn't a general
+//     "let the chatbot write anywhere" hole — just
+//     the canonical per-chatter notes.
 //   - edit_file     : same rationale; preferred over write_file when
-//                     surgically updating MEMORY.md so the model
-//                     doesn't accidentally clobber prior entries.
+//     surgically updating MEMORY.md so the model
+//     doesn't accidentally clobber prior entries.
 //
 // Notably absent: `read_file` / `list_dir` — chatbot mode shouldn't
 // browse the filesystem; USER.md / MEMORY.md content is already loaded
@@ -3099,6 +3105,26 @@ func builtinAllowForMode(mode string) []string {
 	default: // agent (or empty/unknown — defaults to agent for back-compat)
 		return nil // nil = all built-ins exposed
 	}
+}
+
+func builtinAllowForAgent(mode string, override []string) []string {
+	if override != nil {
+		return override
+	}
+	return builtinAllowForMode(mode)
+}
+
+func cloneStringSlice(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	out := make([]string, len(in))
+	copy(out, in)
+	return out
+}
+
+func (a *Agent) builtinAllow() []string {
+	return builtinAllowForAgent(a.promptMode, a.builtinTools)
 }
 
 // WorkspacePath returns the agent's working directory for user-facing files.
@@ -3177,10 +3203,11 @@ func (a *Agent) UpdateConfig(rc config.ResolvedAgent) {
 	// Propagate per-agent prompt mode updates from dashboard saves.
 	// Without this, an operator switching an agent to chatbot mode in
 	// the UI would have to restart the binary for the change to take
-	// effect. The tool filter follows promptMode automatically via
-	// builtinAllowForMode at request time, so no separate hot-reload
-	// hook is needed for the tool surface.
+	// effect. The tool filter reads promptMode plus any builtinTools
+	// override at request time, so no separate hot-reload hook is
+	// needed for the tool surface.
 	a.promptMode = rc.PromptMode
+	a.builtinTools = cloneStringSlice(rc.BuiltinTools)
 	a.ctxBuilder.SetPromptMode(rc.PromptMode)
 	// Per-agent WeChat split-replies. Nil override = keep whatever the
 	// system layer initialized at boot (don't reset to false). Non-nil

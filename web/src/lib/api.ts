@@ -98,10 +98,13 @@ export interface AgentDetail {
   // promptMode is what the backend currently has saved on the
   // agents.defaults row. Empty / undefined = no override (runtime
   // falls back to "agent"). See AgentUpdatePayload.promptMode for
-  // the allowed values. The built-in tool set the LLM sees is a
-  // function of this mode — there's no separate allowlist field by
-  // design. Extend tools via Plugin or MCP, not per-agent toggles.
+  // the allowed values. It also provides the default built-in tool
+  // surface unless builtinTools is set.
   promptMode?: string;
+  // builtinTools optionally narrows built-in tools only. undefined/null =
+  // inherit promptMode defaults; [] = no built-ins; non-empty = expose only
+  // those built-ins. MCP/plugin tools remain visible through their registries.
+  builtinTools?: string[] | null;
   // splitReplies is the per-agent multi-bubble override. Applies to
   // every IM channel uniformly — when on, the agent may emit the
   // SplitMessageMarker between bubbles and the dispatcher honors it.
@@ -1321,6 +1324,12 @@ export interface AgentUpdatePayload {
   // (only the date anchor + bootstrap files — author writes the whole
   // system prompt themselves via SOUL.md / IDENTITY.md). Pass "" to clear.
   promptMode?: "" | "agent" | "chatbot" | "customize";
+  // Narrow the built-in tool surface independently of promptMode. Omit to
+  // leave unchanged; pass [] to expose no built-ins; pass a list of built-in
+  // tool names to expose only those. MCP/plugin tools are unaffected. Pass
+  // `builtinToolsReset: true` to delete the override and inherit promptMode.
+  builtinTools?: string[];
+  builtinToolsReset?: boolean;
   // Multi-bubble per-agent override (applies to all IM channels).
   // Tri-state: omit to leave the saved value alone; pass true/false to
   // set explicit; pass `splitRepliesReset: true` to delete the override
