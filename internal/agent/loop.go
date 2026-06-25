@@ -725,7 +725,23 @@ func (a *Agent) meterTokens(ctx context.Context, sessionKey string, u provider.U
 // HandleMessage path. Providers that don't actually stream still work
 // — they just deliver one big chunk on Done.
 func (a *Agent) streamChatToResponse(ctx context.Context, messages []provider.Message, tools []provider.Tool) (*provider.Response, error) {
-	sr, err := a.provider.ChatStream(ctx, messages, tools, a.model, a.maxTokens, a.temperature)
+	return a.streamChatToResponseWithOptions(ctx, messages, tools, provider.ChatOptions{})
+}
+
+func (a *Agent) streamChatToResponseWithOptions(ctx context.Context, messages []provider.Message, tools []provider.Tool, options provider.ChatOptions) (*provider.Response, error) {
+	var (
+		sr  *provider.StreamReader
+		err error
+	)
+	if options.ToolChoice != nil {
+		if optionProvider, ok := a.provider.(provider.OptionProvider); ok {
+			sr, err = optionProvider.ChatStreamWithOptions(ctx, messages, tools, a.model, a.maxTokens, a.temperature, options)
+		} else {
+			sr, err = a.provider.ChatStream(ctx, messages, tools, a.model, a.maxTokens, a.temperature)
+		}
+	} else {
+		sr, err = a.provider.ChatStream(ctx, messages, tools, a.model, a.maxTokens, a.temperature)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1298,6 +1314,136 @@ func renderClientParams(params map[string]any) string {
 		"The user's client app submitted these parameters alongside " +
 		"the message. Forward them to whichever tool / skill you call.\n\n" +
 		"```json\n" + string(blob) + "\n```"
+}
+
+type requiredToolSequencePolicy struct {
+	sequence         []string
+	next             int
+	noToolRetries    int
+	noToolRetryCount int
+}
+
+func requiredToolSequenceFromParams(params map[string]any, tools []provider.Tool) *requiredToolSequencePolicy {
+	if len(params) == 0 || len(tools) == 0 {
+		return nil
+	}
+	raw, ok := params["fastclaw_tool_policy"]
+	if !ok {
+		raw = params["fastclawToolPolicy"]
+	}
+	policy, ok := raw.(map[string]any)
+	if !ok {
+		return nil
+	}
+	rawSequence, ok := policy["required_sequence"]
+	if !ok {
+		rawSequence = policy["requiredSequence"]
+	}
+	available := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		if tool.Function.Name != "" {
+			available[tool.Function.Name] = struct{}{}
+		}
+	}
+	sequence := make([]string, 0, 4)
+	for _, name := range stringList(rawSequence) {
+		if _, ok := available[name]; ok {
+			sequence = append(sequence, name)
+		}
+	}
+	if len(sequence) == 0 {
+		return nil
+	}
+	retries := intFromPolicy(policy, "max_no_tool_retries", "maxNoToolRetries", 1)
+	if retries < 0 {
+		retries = 0
+	}
+	if retries > 5 {
+		retries = 5
+	}
+	return &requiredToolSequencePolicy{sequence: sequence, noToolRetries: retries}
+}
+
+func (p *requiredToolSequencePolicy) nextTool() string {
+	if p == nil || p.next >= len(p.sequence) {
+		return ""
+	}
+	return p.sequence[p.next]
+}
+
+func (p *requiredToolSequencePolicy) complete() bool {
+	return p == nil || p.next >= len(p.sequence)
+}
+
+func (p *requiredToolSequencePolicy) markSuccessfulTool(name string) {
+	if p == nil || p.complete() {
+		return
+	}
+	if name == p.sequence[p.next] {
+		p.next++
+	}
+}
+
+func (p *requiredToolSequencePolicy) canRetryNoTool() bool {
+	return p != nil && !p.complete() && p.noToolRetryCount < p.noToolRetries
+}
+
+func (p *requiredToolSequencePolicy) noToolNudge() provider.Message {
+	p.noToolRetryCount++
+	next := p.nextTool()
+	return provider.Message{
+		Role: "system",
+		Content: "The previous response did not call the required tool. This turn is not complete. " +
+			"Call `" + next + "` now; do not answer in prose before the required tool call succeeds.",
+	}
+}
+
+func requiredToolChoiceMessage(toolName string) provider.Message {
+	return provider.Message{
+		Role: "system",
+		Content: "This turn has an app-owned required tool sequence. The next required tool is `" +
+			toolName + "`. Call that tool now and do not produce a final answer before the required sequence is complete.",
+	}
+}
+
+func stringList(value any) []string {
+	values, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		name, ok := value.(string)
+		if !ok {
+			continue
+		}
+		name = strings.TrimSpace(name)
+		if name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func intFromPolicy(policy map[string]any, snake, camel string, fallback int) int {
+	value, ok := policy[snake]
+	if !ok {
+		value, ok = policy[camel]
+	}
+	if !ok {
+		return fallback
+	}
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case json.Number:
+		if i, err := typed.Int64(); err == nil {
+			return int(i)
+		}
+	}
+	return fallback
 }
 
 // stripSenderPrefix removes the leading "\[name\]: " (or unescaped
@@ -1962,6 +2108,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	messages = append(messages, a.withMessageTimestamps(sessionMsgs)...)
 
 	toolDefs := a.registry.DefinitionsForMode(a.builtinAllow())
+	requiredToolPolicy := requiredToolSequenceFromParams(msg.Params, toolDefs)
 
 	// Loop detection: track consecutive identical tool calls
 	type toolCallSig struct {
@@ -2034,8 +2181,15 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				),
 			})
 		}
+		chatOptions := provider.ChatOptions{}
+		if callTools != nil && requiredToolPolicy != nil {
+			if nextTool := requiredToolPolicy.nextTool(); nextTool != "" {
+				chatOptions.ToolChoice = &provider.ToolChoice{Name: nextTool}
+				llmMessages = append(llmMessages, requiredToolChoiceMessage(nextTool))
+			}
+		}
 		dumpLLMRequest(a.name, a.model, llmMessages, callTools)
-		resp, err := a.streamChatToResponse(ctx, llmMessages, callTools)
+		resp, err := a.streamChatToResponseWithOptions(ctx, llmMessages, callTools, chatOptions)
 
 		// Hook: AfterModelCall
 		hcAfter := &HookContext{AgentName: a.name, Point: AfterModelCall, Messages: messages, Response: resp, Error: err, StartTime: hcBefore.StartTime, Channel: msg.Channel, AccountID: msg.AccountID, ChatID: msg.ChatID, UserID: a.ownerUserID, GoalSessionKey: a.registry.GoalSessionKey()}
@@ -2051,6 +2205,19 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 		a.maybeRecoverToolCalls(resp)
 
 		if !resp.HasToolCalls() {
+			if requiredToolPolicy.canRetryNoTool() {
+				if resp.Content != "" {
+					messages = append(messages, provider.Message{
+						Role:         "assistant",
+						Content:      resp.Content,
+						Thinking:     resp.Thinking,
+						Timestamp:    time.Now().UnixMilli(),
+						RawAssistant: resp.RawAssistant,
+					})
+				}
+				messages = append(messages, requiredToolPolicy.noToolNudge())
+				continue
+			}
 			asst := provider.Message{Role: "assistant", Content: resp.Content, Thinking: resp.Thinking, Timestamp: time.Now().UnixMilli(), RawAssistant: resp.RawAssistant}
 			sess.Append(asst)
 			emitEvent(ctx, ChatEvent{Type: "content", Data: map[string]any{"content": resp.Content}})
@@ -2265,6 +2432,7 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 				// One call in this round produced a real result —
 				// the round as a whole isn't "all failed".
 				roundAllFailed = false
+				requiredToolPolicy.markSuccessfulTool(r.toolName)
 			}
 
 			// Index in FTS if available

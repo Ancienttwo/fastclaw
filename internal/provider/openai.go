@@ -55,6 +55,7 @@ type chatRequest struct {
 	Model         string            `json:"model"`
 	Messages      []json.RawMessage `json:"messages"`
 	Tools         []Tool            `json:"tools,omitempty"`
+	ToolChoice    any               `json:"tool_choice,omitempty"`
 	MaxTokens     int               `json:"max_tokens,omitempty"`
 	Temperature   float64           `json:"temperature,omitempty"`
 	Stream        bool              `json:"stream"`
@@ -67,6 +68,18 @@ type chatRequest struct {
 // token accounting and admin metering.
 type streamOptions struct {
 	IncludeUsage bool `json:"include_usage,omitempty"`
+}
+
+func openAIToolChoice(choice ToolChoice) any {
+	if strings.TrimSpace(choice.Name) == "" {
+		return "required"
+	}
+	return map[string]any{
+		"type": "function",
+		"function": map[string]string{
+			"name": choice.Name,
+		},
+	}
 }
 
 // sseUsage mirrors the `usage` block returned on the final SSE chunk
@@ -241,7 +254,7 @@ type sseResponse struct {
 	Usage   *sseUsage   `json:"usage,omitempty"` // present only on the final chunk when include_usage=true
 }
 
-func (p *OpenAIProvider) buildRequest(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64, stream bool) (*http.Request, error) {
+func (p *OpenAIProvider) buildRequest(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64, stream bool, options ChatOptions) (*http.Request, error) {
 	req := chatRequest{
 		Model:       StripProviderPrefix(model),
 		Messages:    toAPIMessages(messages),
@@ -258,6 +271,9 @@ func (p *OpenAIProvider) buildRequest(ctx context.Context, messages []Message, t
 	}
 	if len(tools) > 0 {
 		req.Tools = tools
+		if options.ToolChoice != nil {
+			req.ToolChoice = openAIToolChoice(*options.ToolChoice)
+		}
 	}
 
 	body, err := json.Marshal(req)
@@ -277,7 +293,7 @@ func (p *OpenAIProvider) buildRequest(ctx context.Context, messages []Message, t
 }
 
 func (p *OpenAIProvider) Chat(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64) (*Response, error) {
-	httpReq, err := p.buildRequest(ctx, messages, tools, model, maxTokens, temperature, true)
+	httpReq, err := p.buildRequest(ctx, messages, tools, model, maxTokens, temperature, true, ChatOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +314,11 @@ func (p *OpenAIProvider) Chat(ctx context.Context, messages []Message, tools []T
 
 // ChatStream returns a StreamReader that yields chunks as they arrive from the LLM.
 func (p *OpenAIProvider) ChatStream(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64) (*StreamReader, error) {
-	httpReq, err := p.buildRequest(ctx, messages, tools, model, maxTokens, temperature, true)
+	return p.ChatStreamWithOptions(ctx, messages, tools, model, maxTokens, temperature, ChatOptions{})
+}
+
+func (p *OpenAIProvider) ChatStreamWithOptions(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64, options ChatOptions) (*StreamReader, error) {
+	httpReq, err := p.buildRequest(ctx, messages, tools, model, maxTokens, temperature, true, options)
 	if err != nil {
 		return nil, err
 	}

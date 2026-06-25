@@ -252,6 +252,24 @@ type Provider interface {
 	ChatStream(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64) (*StreamReader, error)
 }
 
+// ToolChoice optionally constrains the next provider call to use tools.
+// Name forces one named tool; an empty Name means "any available tool".
+type ToolChoice struct {
+	Name string
+}
+
+// ChatOptions carries optional provider features without expanding the base
+// Provider interface every time an OpenAI-compatible field is needed.
+type ChatOptions struct {
+	ToolChoice *ToolChoice
+}
+
+// OptionProvider is implemented by providers that support request-scoped
+// options such as OpenAI-compatible tool_choice.
+type OptionProvider interface {
+	ChatStreamWithOptions(ctx context.Context, messages []Message, tools []Tool, model string, maxTokens int, temperature float64, options ChatOptions) (*StreamReader, error)
+}
+
 // StripProviderPrefix removes the "provider/" prefix from a model string.
 // e.g. "minimax-coding-plan/MiniMax-M2.7" -> "MiniMax-M2.7"
 func StripProviderPrefix(model string) string {
