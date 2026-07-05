@@ -1,3 +1,7 @@
+// Modified by SalesKo: threaded store.Store into buildSystemSandboxPool
+// so the E2B backend can wire its durable sandbox_bindings registry for
+// the admin erase-user cascade.
+
 package gateway
 
 import (
@@ -93,7 +97,15 @@ func globalSkillsDirPath() (string, error) {
 // with sandbox Enabled but no executor and surfaced "sandbox required
 // but no executor available" to the user. Pulling the pool up to
 // gateway scope makes the borrow path the default for every UserSpace.
-func buildSystemSandboxPool(cfg config.SandboxCfg, ws workspace.Store) sandbox.ExecutorPool {
+//
+// st is threaded through so the E2B backend can wire up its durable
+// sandbox_bindings registry (SetBindingStore below) — the admin
+// erase-user cascade's KillForUser reads that table to enumerate a
+// user's live sandboxes, since the pool's own in-memory map has no user
+// affinity. nil st (shouldn't happen in real boot, only in tests that
+// don't wire storage) just leaves the binding store unset and
+// KillForUser becomes a no-op for that pool.
+func buildSystemSandboxPool(cfg config.SandboxCfg, ws workspace.Store, st store.Store) sandbox.ExecutorPool {
 	if !cfg.Enabled {
 		return nil
 	}
@@ -155,6 +167,9 @@ func buildSystemSandboxPool(cfg config.SandboxCfg, ws workspace.Store) sandbox.E
 	lp := sandbox.NewLifecyclePool(inner, idle, 30*time.Second)
 	if ws != nil {
 		lp.SetWorkspace(ws)
+	}
+	if st != nil {
+		lp.SetBindingStore(st)
 	}
 	lp.Start()
 	slog.Info("system sandbox lifecycle pool enabled",

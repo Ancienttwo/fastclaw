@@ -1,3 +1,7 @@
+// Modified by SalesKo: added sandbox-binding + erased-user tombstone
+// tables and the DeleteUserWithCounts cascade variant for the admin
+// erase-user endpoint.
+
 // Package store is the single persistence layer for FastClaw. The database
 // is mandatory (sqlite by default; postgres for production); there is no
 // file-only fallback. Every per-user table requires a real users.id row;
@@ -33,7 +37,39 @@ type Store interface {
 	ListUsers(ctx context.Context) ([]UserRecord, error)
 	UpdateUser(ctx context.Context, u *UserRecord) error
 	DeleteUser(ctx context.Context, id string) error
+	// DeleteUserWithCounts runs the exact same cascade as DeleteUser but
+	// reports how many rows were removed per table — surfaced in the
+	// admin erase-user receipt so callers get a verifiable accounting of
+	// what was actually deleted, not just an "ok" boolean.
+	DeleteUserWithCounts(ctx context.Context, id string) (DeleteUserCounts, error)
 	CountUsers(ctx context.Context) (int, error)
+
+	// --- Erased-user tombstone (admin erase-user idempotency) ---
+	//
+	// DeleteUser/DeleteUserWithCounts hard-delete the users row, so a
+	// replayed erase request has nothing left to resolve externalId
+	// against. RecordErasedUser is written once, right after a
+	// successful cascade, so a later GetErasedUser lookup lets the
+	// erase-user endpoint distinguish "already erased by this owner"
+	// (replay → same-shape zero-value 200) from "never existed / wrong
+	// owner" (404). Scoped to (ownerUserID, externalID) — the same pair
+	// GetUserByExternal resolves — never to the deleted user_id alone.
+	RecordErasedUser(ctx context.Context, ownerUserID, externalID, userID string, erasedAt time.Time) error
+	GetErasedUser(ctx context.Context, ownerUserID, externalID string) (*ErasedUserRecord, error)
+
+	// --- Sandbox bindings (admin erase-user E2B cascade) ---
+	//
+	// Durably maps a live E2B sandbox to the user it was created for.
+	// The E2B pool's in-memory map is keyed by (agentID, projectID,
+	// sessionID) with no user affinity and doesn't survive a restart or
+	// a sibling replica handling the original request — this table is
+	// the only way KillForUser can enumerate + kill every sandbox
+	// belonging to one user. SaveSandboxBinding upserts (one row per
+	// sandbox_id); DeleteSandboxBinding is a no-op on an already-absent
+	// row (idempotent, mirrors E2B's own idempotent sandbox DELETE).
+	SaveSandboxBinding(ctx context.Context, b *SandboxBindingRecord) error
+	DeleteSandboxBinding(ctx context.Context, sandboxID string) error
+	ListSandboxBindingsByUser(ctx context.Context, userID string) ([]SandboxBindingRecord, error)
 
 	// --- Web sessions (login cookies) ---
 	CreateWebSession(ctx context.Context, sess *WebSessionRecord) error
@@ -313,6 +349,49 @@ type UserRecord struct {
 	AgentQuota int64     `json:"agentQuota"`
 	CreatedAt  time.Time `json:"createdAt"`
 	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
+// DeleteUserCounts reports how many rows DeleteUserWithCounts removed per
+// table. Sessions/SessionMessages/SessionEvents accumulate across BOTH
+// cascade phases (per-owned-agent deletes, keyed by agent_id, and the
+// per-user deletes, keyed by user_id, that also catch this user's
+// sessions on agents they don't own — see DeleteUser). APIKeyAgents
+// includes the trailing orphan-row cleanup that fires as a side effect of
+// deleting this user's own apikeys.
+type DeleteUserCounts struct {
+	Agents          int64 `json:"agents"`
+	AgentFiles      int64 `json:"agentFiles"`
+	Sessions        int64 `json:"sessions"`
+	SessionMessages int64 `json:"sessionMessages"`
+	SessionEvents   int64 `json:"sessionEvents"`
+	CronJobs        int64 `json:"cronJobs"`
+	APIKeyAgents    int64 `json:"apikeyAgents"`
+	WebSessions     int64 `json:"webSessions"`
+	APIKeys         int64 `json:"apikeys"`
+	Configs         int64 `json:"configs"`
+}
+
+// ErasedUserRecord is a tombstone written once a DeleteUserWithCounts
+// cascade completes for an app_user erased via the admin endpoint. It
+// outlives the deleted users row on purpose — see GetErasedUser.
+type ErasedUserRecord struct {
+	OwnerUserID string    `json:"ownerUserId"`
+	ExternalID  string    `json:"externalId"`
+	UserID      string    `json:"userId"`
+	ErasedAt    time.Time `json:"erasedAt"`
+}
+
+// SandboxBindingRecord is one row of the sandbox_bindings table — see the
+// Store interface doc above SaveSandboxBinding for why this table exists.
+// ExecutionRef is the sandbox pool's own cache key (agentID/projectID/
+// sessionID composite) so a kill can also drop the matching in-memory
+// pool entry; it has no meaning outside the sandbox package.
+type SandboxBindingRecord struct {
+	SandboxID    string    `json:"sandboxId"`
+	UserID       string    `json:"userId"`
+	AgentID      string    `json:"agentId"`
+	ExecutionRef string    `json:"executionRef"`
+	CreatedAt    time.Time `json:"createdAt"`
 }
 
 // WebSessionRecord backs cookie-based login state.

@@ -1,3 +1,7 @@
+// Modified by SalesKo: added store/sandboxPool fields + setters and the
+// POST /v1/users/{externalId}/erase route for the admin erase-user
+// cascade.
+
 package api
 
 import (
@@ -9,6 +13,8 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/config"
+	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
+	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/usage"
 )
 
@@ -45,6 +51,18 @@ type Server struct {
 	limiter      *rateLimiter
 	meter        usage.Meter
 	quotaStore   usage.QuotaStore
+	// store backs the admin erase-user cascade (HandleEraseAppUser):
+	// resolving externalId → user_id, running the DB delete cascade,
+	// and recording the erased-user tombstone. nil unless SetStore is
+	// called at boot (main.go wires gw.Store()); every other handler in
+	// this package goes through s.resolver instead, so leaving this
+	// unset doesn't affect them.
+	store store.Store
+	// sandboxPool backs the E2B kill step of the same cascade. nil
+	// unless SetSandboxPool is called; HandleEraseAppUser type-asserts
+	// it to sandbox.UserKiller and treats a non-implementing pool (or a
+	// nil one, i.e. sandboxing disabled) as "nothing to kill".
+	sandboxPool sandbox.ExecutorPool
 }
 
 // NewServer creates a new API server. authResolver is mandatory — there is
@@ -85,6 +103,12 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/users",
 		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleProvisionAppUser)))
 
+	// GDPR-style cascade delete of one app_user provisioned under the
+	// caller's api_key owner account. Same auth + rate-limit shape as
+	// POST /v1/users (api_key only, keyed on the resolved caller).
+	mux.HandleFunc("POST /v1/users/{externalId}/erase",
+		s.authMiddleware(rateLimitMiddleware(s.limiter, getUserID, s.HandleEraseAppUser)))
+
 	// Billing: usage query + quota management. Available to any
 	// authenticated api_key caller so upstream SaaS apps (weclaw etc.)
 	// can pull consumption data and set per-user ceilings.
@@ -103,6 +127,17 @@ func (s *Server) SetMeter(m usage.Meter) { s.meter = m }
 
 // SetQuotaStore installs the quota store for /v1/quota endpoints.
 func (s *Server) SetQuotaStore(qs usage.QuotaStore) { s.quotaStore = qs }
+
+// SetStore installs the storage backend for the admin erase-user
+// cascade (HandleEraseAppUser). Leaving it unset (nil) makes that one
+// endpoint 503 without affecting any other handler in this package.
+func (s *Server) SetStore(st store.Store) { s.store = st }
+
+// SetSandboxPool installs the gateway's shared sandbox pool so the
+// admin erase-user cascade can kill a user's live E2B sandboxes before
+// deleting their DB rows. Leaving it unset (nil) just means that step
+// is skipped — the DB + on-disk cascade still runs.
+func (s *Server) SetSandboxPool(p sandbox.ExecutorPool) { s.sandboxPool = p }
 
 // RegisterAdminRoutes is kept as a no-op for callers that still call it
 // during gateway boot. Admin user/apikey CRUD now lives under /api/admin

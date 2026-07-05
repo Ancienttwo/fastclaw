@@ -1,3 +1,9 @@
+// Modified by SalesKo: added the sandbox_bindings write/cleanup path and
+// KillForUser for the admin erase-user cascade; extracted deleteE2BSandbox
+// out of Close() so both share the same kill primitive; e2bBaseURL and
+// the pool's http.Client are now overridable so tests can point them at a
+// local httptest.Server instead of the real E2B API.
+
 package sandbox
 
 import (
@@ -21,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/workspace"
 )
 
@@ -28,7 +35,10 @@ import (
 // Sandbox creation: POST https://api.e2b.dev/sandboxes
 // Command execution: Connect protocol via envd on the sandbox
 
-const e2bBaseURL = "https://api.e2b.dev"
+// e2bBaseURL is a var (not const) so tests can redirect the kill/create
+// primitives at a local httptest.Server instead of the real E2B API.
+var e2bBaseURL = "https://api.e2b.dev"
+
 const e2bEnvdPort = "49983"
 
 // E2BExecutor implements Executor using E2B hosted sandboxes.
@@ -897,15 +907,32 @@ func verifyWorkspaceWritable(ctx context.Context, ex *E2BExecutor) error {
 }
 
 func (e *E2BExecutor) Close() error {
+	if err := deleteE2BSandbox(e.client, e.apiKey, e.sandboxID); err != nil {
+		return err
+	}
+	slog.Info("e2b sandbox closed", "sandboxID", e.sandboxID)
+	return nil
+}
+
+// deleteE2BSandbox is the shared kill primitive: DELETE /sandboxes/{id}.
+// Extracted out of Close() so E2BExecutorPool.KillForUser can destroy a
+// sandbox that isn't (or is no longer) cached in the pool's in-memory
+// map — e.g. a binding row left behind by a sibling replica, or one this
+// process forgot about across a restart. Only a transport-level error
+// (client.Do failing) is treated as failure; like the original Close(),
+// this deliberately does not inspect the response status — E2B's DELETE
+// is idempotent (a sandbox that's already gone still responds, it just
+// doesn't do anything), so there's nothing a non-2xx here would tell the
+// caller that a network error wouldn't already say more directly.
+func deleteE2BSandbox(client *http.Client, apiKey, sandboxID string) error {
 	req, _ := http.NewRequest("DELETE",
-		fmt.Sprintf("%s/sandboxes/%s", e2bBaseURL, e.sandboxID), nil)
-	req.Header.Set("X-API-Key", e.apiKey)
-	resp, err := e.client.Do(req)
+		fmt.Sprintf("%s/sandboxes/%s", e2bBaseURL, sandboxID), nil)
+	req.Header.Set("X-API-Key", apiKey)
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	resp.Body.Close()
-	slog.Info("e2b sandbox closed", "sandboxID", e.sandboxID)
 	return nil
 }
 
@@ -926,6 +953,20 @@ type E2BExecutorPool struct {
 	timeout   time.Duration
 	home      string          // workspace root used to resolve per-agent skill dirs
 	workspace workspace.Store // optional — when set, /workspace is hydrated alongside /skills
+	// bindingStore, when set, durably records (sandbox_id → user_id,
+	// agent_id, execution_ref) so the admin erase-user cascade can
+	// enumerate + kill every sandbox belonging to a user via
+	// KillForUser, even one this process never created (sibling
+	// replica) or has since forgotten (restart). Optional: nil just
+	// means Get()/Release() skip the bookkeeping and KillForUser has
+	// nothing to enumerate.
+	bindingStore store.Store
+	// httpClient backs the kill primitive used by KillForUser (which
+	// has no live *E2BExecutor to borrow a client from for bindings it
+	// didn't create). Defaults to http.DefaultClient; overridable so
+	// tests can point it at a local httptest.Server without touching
+	// global state.
+	httpClient *http.Client
 }
 
 // NewE2BExecutorPool — `home` is the FASTCLAW_HOME the docker backend
@@ -933,12 +974,24 @@ type E2BExecutorPool struct {
 // skill dirs to push into each fresh sandbox.
 func NewE2BExecutorPool(apiKey, template, home string, timeout time.Duration) *E2BExecutorPool {
 	return &E2BExecutorPool{
-		executors: make(map[string]*E2BExecutor),
-		apiKey:    apiKey,
-		template:  template,
-		timeout:   timeout,
-		home:      home,
+		executors:  make(map[string]*E2BExecutor),
+		apiKey:     apiKey,
+		template:   template,
+		timeout:    timeout,
+		home:       home,
+		httpClient: http.DefaultClient,
 	}
+}
+
+// SetBindingStore installs the durable store used to persist per-sandbox
+// user ownership. Optional — nil (the default) just means Get()/Release()
+// skip the bookkeeping and KillForUser has nothing to enumerate for this
+// pool. Mirrors the SetWorkspace wiring convention: called once at boot
+// by buildSystemSandboxPool.
+func (p *E2BExecutorPool) SetBindingStore(st store.Store) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.bindingStore = st
 }
 
 // SetWorkspace plugs in the workspace.Store whose contents should be
@@ -982,7 +1035,42 @@ func (p *E2BExecutorPool) Get(ctx context.Context, agentID, projectID, sessionID
 	}
 	warmupCamoufoxDaemon(ctx, ex)
 	p.executors[key] = ex
+	p.recordBinding(ctx, ex, agentID, key)
 	return ex, nil
+}
+
+// recordBinding persists the sandbox_bindings row for a freshly-created
+// sandbox, when both a binding store is configured AND the caller tagged
+// ctx with the acting user (see sandbox.WithUserID — set by
+// Agent.HandleMessage before bindSession/Get, empty for callers that
+// don't know about chatters like cron flushes or admin reload triggers).
+// Best-effort: a write failure here only means the admin erase-user
+// cascade won't discover this specific sandbox via the binding table
+// until it's naturally recreated (idle eviction, error-triggered
+// recreate, or this same process's own Release) — it must not fail the
+// chat turn that's waiting on this sandbox.
+func (p *E2BExecutorPool) recordBinding(ctx context.Context, ex *E2BExecutor, agentID, executionRef string) {
+	p.mu.Lock()
+	bs := p.bindingStore
+	p.mu.Unlock()
+	if bs == nil {
+		return
+	}
+	uid := UserIDFromContext(ctx)
+	if uid == "" {
+		return
+	}
+	rec := &store.SandboxBindingRecord{
+		SandboxID:    ex.sandboxID,
+		UserID:       uid,
+		AgentID:      agentID,
+		ExecutionRef: executionRef,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if err := bs.SaveSandboxBinding(ctx, rec); err != nil {
+		slog.Warn("e2b: failed to persist sandbox binding (admin erase-user cascade won't see this sandbox until it's recreated)",
+			"sandboxID", ex.sandboxID, "userID", uid, "error", err)
+	}
 }
 
 // warmupCamoufoxDaemon spawns the camoufox-cli background daemon as part
@@ -1020,12 +1108,27 @@ func (p *E2BExecutorPool) Release(agentID, projectID, sessionID string) error {
 	p.mu.Lock()
 	key := poolKey(agentID, projectID, sessionID)
 	ex, ok := p.executors[key]
+	bs := p.bindingStore
 	delete(p.executors, key)
 	p.mu.Unlock()
-	if ok {
-		return ex.Close()
+	if !ok {
+		return nil
 	}
-	return nil
+	err := ex.Close()
+	// Clear the binding regardless of Close's outcome — Close's own
+	// DELETE is idempotent, and leaving a stale row behind for a
+	// sandbox we just told E2B to destroy would make a later
+	// KillForUser report a "live" sandbox that's actually already
+	// gone. Release has no request ctx to thread through (interface
+	// signature predates this feature); context.Background() is
+	// correct here since this is bookkeeping cleanup, not a
+	// user-facing operation that should inherit a request deadline.
+	if bs != nil {
+		if derr := bs.DeleteSandboxBinding(context.Background(), ex.sandboxID); derr != nil {
+			slog.Warn("e2b: failed to clear sandbox binding on release", "sandboxID", ex.sandboxID, "error", derr)
+		}
+	}
+	return err
 }
 
 func (p *E2BExecutorPool) CloseAll() {
@@ -1033,8 +1136,60 @@ func (p *E2BExecutorPool) CloseAll() {
 	defer p.mu.Unlock()
 	for _, ex := range p.executors {
 		ex.Close()
+		if p.bindingStore != nil {
+			if derr := p.bindingStore.DeleteSandboxBinding(context.Background(), ex.sandboxID); derr != nil {
+				slog.Warn("e2b: failed to clear sandbox binding on shutdown", "sandboxID", ex.sandboxID, "error", derr)
+			}
+		}
 	}
 	p.executors = make(map[string]*E2BExecutor)
+}
+
+// KillForUser destroys every sandbox durably bound to userID (reading the
+// sandbox_bindings table, not the in-memory map — see the bindingStore
+// field doc) and reports which succeeded/failed. Used by the admin
+// erase-user cascade.
+//
+// Order per binding: drop the in-memory cache entry first (if this
+// process happens to hold it) so a racing Get() on the same
+// execution_ref can't hand out a reference to the sandbox we're about to
+// destroy, then call the DELETE primitive, then clear the binding row
+// only on success — a failed kill leaves its row in place so a retried
+// KillForUser (or the next natural recreate) gets another chance at it.
+func (p *E2BExecutorPool) KillForUser(ctx context.Context, userID string) ([]string, []KillFailure, error) {
+	p.mu.Lock()
+	bs := p.bindingStore
+	client := p.httpClient
+	p.mu.Unlock()
+	if bs == nil {
+		return nil, nil, nil
+	}
+	if client == nil {
+		client = http.DefaultClient
+	}
+	bindings, err := bs.ListSandboxBindingsByUser(ctx, userID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("list sandbox bindings for user %s: %w", userID, err)
+	}
+	var killed []string
+	var failed []KillFailure
+	for _, b := range bindings {
+		p.mu.Lock()
+		if ex, ok := p.executors[b.ExecutionRef]; ok && ex.sandboxID == b.SandboxID {
+			delete(p.executors, b.ExecutionRef)
+		}
+		p.mu.Unlock()
+
+		if derr := deleteE2BSandbox(client, p.apiKey, b.SandboxID); derr != nil {
+			failed = append(failed, KillFailure{SandboxID: b.SandboxID, Error: derr.Error()})
+			continue
+		}
+		killed = append(killed, b.SandboxID)
+		if berr := bs.DeleteSandboxBinding(ctx, b.SandboxID); berr != nil {
+			slog.Warn("e2b: sandbox killed but binding row cleanup failed", "sandboxID", b.SandboxID, "error", berr)
+		}
+	}
+	return killed, failed, nil
 }
 
 var (

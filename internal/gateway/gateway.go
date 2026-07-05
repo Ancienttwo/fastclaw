@@ -1,3 +1,7 @@
+// Modified by SalesKo: pass the store into buildSystemSandboxPool so the
+// E2B backend can wire its durable sandbox-binding registry for the
+// admin erase-user cascade.
+
 // Package gateway is the runtime orchestrator. It opens the store, hosts
 // per-user UserSpaces (lazy-loaded on first auth), and starts the channel
 // manager / cron scheduler / webhook server / plugin manager.
@@ -370,7 +374,7 @@ func New(env *config.EnvConfig) (*Gateway, error) {
 	// its own) need this — without a system-level pool, the per-user
 	// builder produced nil for those spaces and the agent's exec tool
 	// refused to run with "sandbox required but no executor available".
-	systemSandboxPool := buildSystemSandboxPool(readSystemSandboxCfg(st), ws)
+	systemSandboxPool := buildSystemSandboxPool(readSystemSandboxCfg(st), ws, st)
 
 	// Accounts service is used by the inbound routing loop to lazy-mint
 	// per-(channel, IM-sender) app_user rows so each chatter on an IM

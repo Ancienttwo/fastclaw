@@ -1,3 +1,8 @@
+// Modified by SalesKo: added sandbox_bindings + erased_users tables,
+// count-returning config-delete helpers, and the DeleteUserWithCounts /
+// sandbox-binding / erased-user-tombstone store methods for the admin
+// erase-user endpoint.
+
 package store
 
 import (
@@ -32,18 +37,31 @@ func escapeSQLLikePattern(s string) string {
 	return repl.Replace(s)
 }
 
-func (d *DBStore) deleteConfigsForAgent(ctx context.Context, exec sqlExecer, agentID string) error {
-	_, err := exec.ExecContext(ctx,
+// deleteConfigsForAgent returns the number of rows removed alongside the
+// error so DeleteUserWithCounts can fold it into the per-user receipt;
+// DeleteAgent (which doesn't report counts) just discards it.
+func (d *DBStore) deleteConfigsForAgent(ctx context.Context, exec sqlExecer, agentID string) (int64, error) {
+	res, err := exec.ExecContext(ctx,
 		fmt.Sprintf(`DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s ESCAPE '\'`, d.ph(1), d.ph(2)),
 		agentID, "%/"+escapeSQLLikePattern(agentID))
-	return err
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
-func (d *DBStore) deleteConfigsForUser(ctx context.Context, exec sqlExecer, userID string) error {
-	_, err := exec.ExecContext(ctx,
+// deleteConfigsForUser mirrors deleteConfigsForAgent's count return — see
+// its comment.
+func (d *DBStore) deleteConfigsForUser(ctx context.Context, exec sqlExecer, userID string) (int64, error) {
+	res, err := exec.ExecContext(ctx,
 		fmt.Sprintf(`DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s ESCAPE '\'`, d.ph(1), d.ph(2)),
 		userID, escapeSQLLikePattern(userID)+"/%")
-	return err
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // NewDBStore creates a database-backed store.
@@ -1829,6 +1847,31 @@ func (d *DBStore) migrationSQL() []string {
 			UNIQUE (type, account_id)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_channels_user ON channels (user_id, agent_id)`,
+		// sandbox_bindings durably maps a live E2B sandbox to the user
+		// it was created for — see the Store interface doc on
+		// SaveSandboxBinding. sandbox_id is the natural key (E2B's own
+		// globally-unique id); one row per live sandbox.
+		`CREATE TABLE IF NOT EXISTS sandbox_bindings (
+			sandbox_id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			agent_id TEXT NOT NULL DEFAULT '',
+			execution_ref TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sandbox_bindings_user ON sandbox_bindings (user_id)`,
+		// erased_users is a tombstone written once per successful admin
+		// erase-user cascade — see the Store interface doc on
+		// RecordErasedUser. Deliberately keyed by (owner_user_id,
+		// external_id), the same pair GetUserByExternal resolves,
+		// never by the deleted user_id (which no longer exists after
+		// DeleteUserWithCounts commits).
+		`CREATE TABLE IF NOT EXISTS erased_users (
+			owner_user_id TEXT NOT NULL,
+			external_id TEXT NOT NULL,
+			user_id TEXT NOT NULL,
+			erased_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (owner_user_id, external_id)
+		)`,
 	}
 }
 
@@ -1971,9 +2014,30 @@ func (d *DBStore) UpdateUser(ctx context.Context, u *UserRecord) error {
 }
 
 func (d *DBStore) DeleteUser(ctx context.Context, id string) error {
+	_, err := d.deleteUserCascade(ctx, id)
+	return err
+}
+
+// DeleteUserWithCounts runs the identical cascade DeleteUser does but
+// additionally reports how many rows were removed per table — see
+// DeleteUserCounts. Used by the admin erase-user endpoint to build a
+// verifiable receipt; DeleteUser's own signature is left untouched so
+// every existing caller (account deletion via the dashboard, etc.) is
+// unaffected.
+func (d *DBStore) DeleteUserWithCounts(ctx context.Context, id string) (DeleteUserCounts, error) {
+	return d.deleteUserCascade(ctx, id)
+}
+
+// deleteUserCascade is the single implementation shared by DeleteUser and
+// DeleteUserWithCounts. RowsAffected is read off every DELETE (ignoring
+// its own error per the existing d.ph-based call convention elsewhere in
+// this file — a driver that can't report it just leaves the counter at
+// 0, which only degrades the receipt's accuracy, not the delete itself).
+func (d *DBStore) deleteUserCascade(ctx context.Context, id string) (DeleteUserCounts, error) {
+	var counts DeleteUserCounts
 	tx, err := d.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return counts, err
 	}
 	defer tx.Rollback()
 	// First, find every agent owned by this user — we'll cascade through
@@ -1982,65 +2046,201 @@ func (d *DBStore) DeleteUser(ctx context.Context, id string) error {
 	rows, err := tx.QueryContext(ctx,
 		fmt.Sprintf("SELECT id FROM agents WHERE user_id = %s", d.ph(1)), id)
 	if err != nil {
-		return err
+		return counts, err
 	}
 	var ownedAgents []string
 	for rows.Next() {
 		var aid string
 		if err := rows.Scan(&aid); err != nil {
 			rows.Close()
-			return err
+			return counts, err
 		}
 		ownedAgents = append(ownedAgents, aid)
 	}
 	rows.Close()
 	for _, aid := range ownedAgents {
 		for _, t := range []string{"agent_files", "sessions", "session_messages", "session_events", "cron_jobs"} {
-			if _, err := tx.ExecContext(ctx,
-				fmt.Sprintf("DELETE FROM %s WHERE agent_id = %s", t, d.ph(1)), aid); err != nil {
-				return err
+			res, err := tx.ExecContext(ctx,
+				fmt.Sprintf("DELETE FROM %s WHERE agent_id = %s", t, d.ph(1)), aid)
+			if err != nil {
+				return counts, err
+			}
+			n, _ := res.RowsAffected()
+			switch t {
+			case "agent_files":
+				counts.AgentFiles += n
+			case "sessions":
+				counts.Sessions += n
+			case "session_messages":
+				counts.SessionMessages += n
+			case "session_events":
+				counts.SessionEvents += n
+			case "cron_jobs":
+				counts.CronJobs += n
 			}
 		}
-		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM apikey_agents WHERE agent_id = %s", d.ph(1)), aid); err != nil {
-			return err
+		res, err := tx.ExecContext(ctx,
+			fmt.Sprintf("DELETE FROM apikey_agents WHERE agent_id = %s", d.ph(1)), aid)
+		if err != nil {
+			return counts, err
 		}
-		if err := d.deleteConfigsForAgent(ctx, tx, aid); err != nil {
-			return fmt.Errorf("delete configs for owned agent %s: %w", aid, err)
+		if n, _ := res.RowsAffected(); n > 0 {
+			counts.APIKeyAgents += n
 		}
+		n, err := d.deleteConfigsForAgent(ctx, tx, aid)
+		if err != nil {
+			return counts, fmt.Errorf("delete configs for owned agent %s: %w", aid, err)
+		}
+		counts.Configs += n
 	}
-	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf("DELETE FROM agents WHERE user_id = %s", d.ph(1)), id); err != nil {
-		return err
+	res, err := tx.ExecContext(ctx,
+		fmt.Sprintf("DELETE FROM agents WHERE user_id = %s", d.ph(1)), id)
+	if err != nil {
+		return counts, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		counts.Agents += n
 	}
 	// Per-user state that's not agent-scoped (agent_files is now agent-only).
 	for _, t := range []string{"web_sessions", "apikeys", "sessions", "session_messages", "session_events"} {
-		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM %s WHERE user_id = %s", t, d.ph(1)), id); err != nil {
-			return err
+		res, err := tx.ExecContext(ctx,
+			fmt.Sprintf("DELETE FROM %s WHERE user_id = %s", t, d.ph(1)), id)
+		if err != nil {
+			return counts, err
+		}
+		n, _ := res.RowsAffected()
+		switch t {
+		case "web_sessions":
+			counts.WebSessions += n
+		case "apikeys":
+			counts.APIKeys += n
+		case "sessions":
+			counts.Sessions += n
+		case "session_messages":
+			counts.SessionMessages += n
+		case "session_events":
+			counts.SessionEvents += n
 		}
 	}
 	// Drop every config row owned by this user — both their own
 	// ('user_id=X, agent_id="') and any per-agent overrides they
 	// authored on someone else's agent ('user_id=X, agent_id=Y').
-	if err := d.deleteConfigsForUser(ctx, tx, id); err != nil {
-		return fmt.Errorf("delete configs for user %s: %w", id, err)
+	n, err := d.deleteConfigsForUser(ctx, tx, id)
+	if err != nil {
+		return counts, fmt.Errorf("delete configs for user %s: %w", id, err)
 	}
-	if _, err := tx.ExecContext(ctx,
-		`DELETE FROM apikey_agents WHERE apikey_id NOT IN (SELECT id FROM apikeys)`); err != nil {
-		return err
+	counts.Configs += n
+	res, err = tx.ExecContext(ctx,
+		`DELETE FROM apikey_agents WHERE apikey_id NOT IN (SELECT id FROM apikeys)`)
+	if err != nil {
+		return counts, err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		counts.APIKeyAgents += n
 	}
 	if _, err := tx.ExecContext(ctx,
 		fmt.Sprintf("DELETE FROM users WHERE id = %s", d.ph(1)), id); err != nil {
-		return err
+		return counts, err
 	}
-	return tx.Commit()
+	return counts, tx.Commit()
 }
 
 func (d *DBStore) CountUsers(ctx context.Context) (int, error) {
 	var n int
 	err := d.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&n)
 	return n, err
+}
+
+// RecordErasedUser upserts the tombstone for one admin erase-user
+// cascade. Upsert (not plain INSERT) because a caller could in principle
+// retry the DB-write step after a transient failure on the very first
+// attempt — the tombstone itself has no cascade semantics, so overwriting
+// it with the same (or a slightly later) erasedAt is harmless.
+func (d *DBStore) RecordErasedUser(ctx context.Context, ownerUserID, externalID, userID string, erasedAt time.Time) error {
+	if d.dialect == "postgres" {
+		_, err := d.db.ExecContext(ctx,
+			`INSERT INTO erased_users (owner_user_id, external_id, user_id, erased_at) VALUES ($1, $2, $3, $4)
+				ON CONFLICT (owner_user_id, external_id) DO UPDATE SET user_id = EXCLUDED.user_id, erased_at = EXCLUDED.erased_at`,
+			ownerUserID, externalID, userID, erasedAt)
+		return err
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO erased_users (owner_user_id, external_id, user_id, erased_at) VALUES (?, ?, ?, ?)
+			ON CONFLICT (owner_user_id, external_id) DO UPDATE SET user_id = excluded.user_id, erased_at = excluded.erased_at`,
+		ownerUserID, externalID, userID, erasedAt)
+	return err
+}
+
+// GetErasedUser returns the tombstone for (ownerUserID, externalID), or
+// ErrNotFound when no erase has ever run for that pair.
+func (d *DBStore) GetErasedUser(ctx context.Context, ownerUserID, externalID string) (*ErasedUserRecord, error) {
+	row := d.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT owner_user_id, external_id, user_id, erased_at FROM erased_users WHERE owner_user_id = %s AND external_id = %s`,
+			d.ph(1), d.ph(2)),
+		ownerUserID, externalID)
+	var rec ErasedUserRecord
+	if err := row.Scan(&rec.OwnerUserID, &rec.ExternalID, &rec.UserID, &rec.ErasedAt); err != nil {
+		return nil, scanErr(err)
+	}
+	return &rec, nil
+}
+
+// SaveSandboxBinding upserts the (sandbox_id) → (user_id, agent_id,
+// execution_ref) mapping. Upsert because a pool eviction-then-recreate
+// racing an in-flight Get for the same execution_ref could otherwise trip
+// a PRIMARY KEY conflict on sandbox_id reuse (E2B ids are unique per
+// sandbox instance, but defensive upsert costs nothing here).
+func (d *DBStore) SaveSandboxBinding(ctx context.Context, b *SandboxBindingRecord) error {
+	if b == nil || b.SandboxID == "" {
+		return errors.New("store.SaveSandboxBinding: sandboxID is required")
+	}
+	if b.CreatedAt.IsZero() {
+		b.CreatedAt = time.Now().UTC()
+	}
+	if d.dialect == "postgres" {
+		_, err := d.db.ExecContext(ctx,
+			`INSERT INTO sandbox_bindings (sandbox_id, user_id, agent_id, execution_ref, created_at) VALUES ($1, $2, $3, $4, $5)
+				ON CONFLICT (sandbox_id) DO UPDATE SET user_id = EXCLUDED.user_id, agent_id = EXCLUDED.agent_id, execution_ref = EXCLUDED.execution_ref`,
+			b.SandboxID, b.UserID, b.AgentID, b.ExecutionRef, b.CreatedAt)
+		return err
+	}
+	_, err := d.db.ExecContext(ctx,
+		`INSERT INTO sandbox_bindings (sandbox_id, user_id, agent_id, execution_ref, created_at) VALUES (?, ?, ?, ?, ?)
+			ON CONFLICT (sandbox_id) DO UPDATE SET user_id = excluded.user_id, agent_id = excluded.agent_id, execution_ref = excluded.execution_ref`,
+		b.SandboxID, b.UserID, b.AgentID, b.ExecutionRef, b.CreatedAt)
+	return err
+}
+
+// DeleteSandboxBinding removes one binding row. No-op (nil error) when
+// the row is already gone — mirrors E2B's own idempotent sandbox DELETE
+// so callers (Release, KillForUser) never need to distinguish "already
+// cleared" from "cleared just now".
+func (d *DBStore) DeleteSandboxBinding(ctx context.Context, sandboxID string) error {
+	_, err := d.db.ExecContext(ctx,
+		fmt.Sprintf(`DELETE FROM sandbox_bindings WHERE sandbox_id = %s`, d.ph(1)), sandboxID)
+	return err
+}
+
+// ListSandboxBindingsByUser returns every live-sandbox binding for
+// userID. Used by the admin erase-user cascade's KillForUser to
+// enumerate what to destroy.
+func (d *DBStore) ListSandboxBindingsByUser(ctx context.Context, userID string) ([]SandboxBindingRecord, error) {
+	rows, err := d.db.QueryContext(ctx,
+		fmt.Sprintf(`SELECT sandbox_id, user_id, agent_id, execution_ref, created_at FROM sandbox_bindings WHERE user_id = %s ORDER BY created_at`, d.ph(1)),
+		userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SandboxBindingRecord
+	for rows.Next() {
+		var b SandboxBindingRecord
+		if err := rows.Scan(&b.SandboxID, &b.UserID, &b.AgentID, &b.ExecutionRef, &b.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
 }
 
 // --- Web sessions ---
@@ -2288,7 +2488,7 @@ func (d *DBStore) DeleteAgent(ctx context.Context, agentID string) error {
 	// rows (user_id='', agent_id=X), agent owner's per-agent overrides
 	// (user_id=owner, agent_id=X), and any non-owner per-agent
 	// overrides (user_id=other, agent_id=X).
-	if err := d.deleteConfigsForAgent(ctx, tx, agentID); err != nil {
+	if _, err := d.deleteConfigsForAgent(ctx, tx, agentID); err != nil {
 		return fmt.Errorf("delete configs for agent %s: %w", agentID, err)
 	}
 	if _, err := tx.ExecContext(ctx,

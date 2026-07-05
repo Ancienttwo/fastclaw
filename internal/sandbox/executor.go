@@ -1,3 +1,6 @@
+// Modified by SalesKo: added the UserKiller optional capability +
+// KillFailure for the admin erase-user cascade.
+
 package sandbox
 
 import (
@@ -93,6 +96,28 @@ type PortExposer interface {
 // the template); remote backends (E2B) upload a tarball and extract it.
 type TemplateProvisioner interface {
 	ProvisionDir(ctx context.Context, localDir, destDir string) error
+}
+
+// KillFailure records one sandbox UserKiller could not destroy, paired
+// with the error so the admin erase-user receipt can surface it instead
+// of silently dropping it (a 207 partial-success response, not a
+// swallowed failure).
+type KillFailure struct {
+	SandboxID string `json:"sandboxId"`
+	Error     string `json:"error"`
+}
+
+// UserKiller is an optional ExecutorPool capability: destroy every live
+// sandbox durably bound to userID and report which succeeded/failed.
+// Only backends with a durable per-sandbox ownership record can
+// implement this — the in-memory pool map alone has no user affinity and
+// doesn't survive a restart or a sibling replica handling the original
+// request. Currently only E2BExecutorPool implements it (via the
+// sandbox_bindings store table); docker/boxlite don't. The admin
+// erase-user cascade type-asserts and treats absence as "nothing to
+// kill" for that backend, same idiom as WorkspaceSnapshotter above.
+type UserKiller interface {
+	KillForUser(ctx context.Context, userID string) (killed []string, failed []KillFailure, err error)
 }
 
 // PoolConfig holds configuration for creating sandbox pools.

@@ -1,3 +1,8 @@
+// Modified by SalesKo: added SetBindingStore + KillForUser delegation to
+// the inner pool so the admin erase-user cascade can reach E2B's
+// KillForUser through the LifecyclePool wrapper every caller actually
+// holds a reference to.
+
 package sandbox
 
 import (
@@ -9,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/workspace"
 )
 
@@ -106,6 +112,35 @@ func (p *LifecyclePool) SetWorkspace(ws workspace.Store) {
 // shouldn't double-hydrate via the per-file path).
 type workspaceAware interface {
 	SetWorkspace(ws workspace.Store)
+}
+
+// SetBindingStore forwards to the inner pool when it durably records
+// per-sandbox user ownership (currently only E2B). No-op otherwise —
+// docker/boxlite don't implement bindingStoreAware, so this just does
+// nothing for them, same as SetWorkspace's silent skip on a backend that
+// doesn't want it.
+func (p *LifecyclePool) SetBindingStore(st store.Store) {
+	if ba, ok := p.inner.(bindingStoreAware); ok {
+		ba.SetBindingStore(st)
+	}
+}
+
+// bindingStoreAware is implemented by inner pools that durably record
+// per-sandbox user ownership (currently E2BExecutorPool).
+type bindingStoreAware interface {
+	SetBindingStore(st store.Store)
+}
+
+// KillForUser delegates to the inner pool when it implements UserKiller
+// (currently only E2B). Returns (nil, nil, nil) for backends that don't
+// — the admin erase-user cascade treats that identically to "this
+// backend has nothing to kill for this user," which is accurate: docker/
+// boxlite sandboxes aren't tracked per-user at all today.
+func (p *LifecyclePool) KillForUser(ctx context.Context, userID string) ([]string, []KillFailure, error) {
+	if uk, ok := p.inner.(UserKiller); ok {
+		return uk.KillForUser(ctx, userID)
+	}
+	return nil, nil, nil
 }
 
 // Start the idle sweep goroutine. Safe to call multiple times; only the

@@ -1,3 +1,6 @@
+// Modified by SalesKo: wire the api.Server's store + sandbox pool for
+// the admin erase-user cascade.
+
 package main
 
 import (
@@ -192,6 +195,12 @@ func runGateway(port int) error {
 	apiSrv := api.NewServer(&apiResolver{gw: gw}, authResolver, gwCfg)
 	apiSrv.SetMeter(gw.Usage())
 	apiSrv.SetQuotaStore(gw.QuotaStore())
+	// Backs POST /v1/users/{externalId}/erase (admin GDPR-style cascade
+	// delete): the DB cascade + tombstone need the store directly, and
+	// the E2B sandbox kill step needs the same shared pool every agent
+	// already execs through.
+	apiSrv.SetStore(gw.Store())
+	apiSrv.SetSandboxPool(gw.SandboxPool())
 	webSrv.SetAPIServer(apiSrv)
 
 	// Coding-agent project runtime: long-lived dev-server sandbox +
