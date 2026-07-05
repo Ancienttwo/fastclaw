@@ -1,3 +1,6 @@
+// Added by SalesKo: sandbox_bindings table lifecycle tests for the admin
+// erase-user cascade.
+
 package store
 
 import (

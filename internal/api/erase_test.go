@@ -1,3 +1,5 @@
+// Added by SalesKo: admin erase-user cascade endpoint tests.
+
 package api
 
 import (
@@ -269,5 +271,115 @@ func TestHandleEraseAppUserNoSandboxPoolStillErases(t *testing.T) {
 	}
 	if _, err := st.GetUser(ctx, "u_app3"); err == nil {
 		t.Fatal("u_app3 row should be gone")
+	}
+}
+
+// TestHandleEraseAppUserReProvisionAfterEraseIsNotBlockedByTombstone locks
+// in the exact sequence the gatekeeper code-traced as correct but wasn't
+// covered by a test: erase → re-provision the SAME external_id under the
+// SAME owner (via the real users.Accounts.EnsureAppUser path, not a
+// hand-rolled CreateUser) → the re-provision mints a BRAND-NEW user_id
+// (EnsureAppUser only consults GetUserByExternal, which has no idea the
+// erased_users tombstone exists — the old row is hard-deleted, so it
+// correctly reports ErrNotFound and EnsureAppUser falls through to
+// CreateUser) → a second erase against the new user cascades for real
+// (not a tombstone replay) → the tombstone upsert overwrites the first
+// erase's record with the new user_id rather than erroring or going
+// stale → a THIRD call (replaying the second erase) reports the
+// re-provisioned account's id, proving the tombstone always reflects the
+// LATEST erase for that (owner, externalId) pair.
+func TestHandleEraseAppUserReProvisionAfterEraseIsNotBlockedByTombstone(t *testing.T) {
+	st := newEraseTestStore(t)
+	ctx := context.Background()
+	accounts, err := users.NewAccounts(st)
+	if err != nil {
+		t.Fatalf("users.NewAccounts: %v", err)
+	}
+	srv := &Server{store: st}
+	ident := auth.Identity{UserID: "owner_D", Role: users.RoleUser, AuthMethod: "apikey", APIKeyID: "ak_d"}
+
+	// First provisioning + erase.
+	acc1, err := accounts.EnsureAppUser(ctx, "owner_D", "ext-shared", "", "ak_d")
+	if err != nil {
+		t.Fatalf("EnsureAppUser (first): %v", err)
+	}
+	rec1 := httptest.NewRecorder()
+	srv.HandleEraseAppUser(rec1, eraseRequest(ident, "ext-shared"))
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("first erase status = %d, want 200, body=%s", rec1.Code, rec1.Body.String())
+	}
+	receipt1 := decodeReceipt(t, rec1)
+	if receipt1.UserID != acc1.ID {
+		t.Fatalf("first erase userId = %q, want %q", receipt1.UserID, acc1.ID)
+	}
+	tomb1, err := st.GetErasedUser(ctx, "owner_D", "ext-shared")
+	if err != nil {
+		t.Fatalf("GetErasedUser after first erase: %v", err)
+	}
+	if tomb1.UserID != acc1.ID {
+		t.Fatalf("tombstone userId after first erase = %q, want %q", tomb1.UserID, acc1.ID)
+	}
+
+	// Re-provision the SAME external_id under the SAME owner — must mint
+	// a fresh user_id, not be blocked or short-circuited by the
+	// tombstone.
+	acc2, err := accounts.EnsureAppUser(ctx, "owner_D", "ext-shared", "", "ak_d")
+	if err != nil {
+		t.Fatalf("EnsureAppUser (re-provision): %v", err)
+	}
+	if acc2.ID == acc1.ID {
+		t.Fatalf("re-provision minted the SAME user_id %q as the erased account — want a fresh id", acc2.ID)
+	}
+
+	// Give the new account something to cascade so the second erase
+	// exercises a real cascade, not a no-op.
+	if err := st.SaveAgent(ctx, &store.AgentRecord{ID: "agt_reprovision", UserID: acc2.ID, Name: "agent"}); err != nil {
+		t.Fatalf("seed agent for re-provisioned user: %v", err)
+	}
+
+	// Second erase against the NEW user must cascade for real — this is
+	// NOT a replay (GetUserByExternal resolves the re-provisioned row
+	// fine), so it must not take the tombstone-idempotent-replay branch.
+	rec2 := httptest.NewRecorder()
+	srv.HandleEraseAppUser(rec2, eraseRequest(ident, "ext-shared"))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("second erase status = %d, want 200, body=%s", rec2.Code, rec2.Body.String())
+	}
+	receipt2 := decodeReceipt(t, rec2)
+	if receipt2.UserID != acc2.ID {
+		t.Fatalf("second erase userId = %q, want %q (the re-provisioned account)", receipt2.UserID, acc2.ID)
+	}
+	if receipt2.DB.Agents != 1 {
+		t.Fatalf("second erase receipt.DB.Agents = %d, want 1 (a real cascade, not a tombstone replay)", receipt2.DB.Agents)
+	}
+	if _, err := st.GetAgent(ctx, "agt_reprovision"); err == nil {
+		t.Fatal("agt_reprovision should be gone after the second erase")
+	}
+
+	// Tombstone now reflects the SECOND erase — upsert overwrote the
+	// first record's user_id rather than erroring or leaving it stale.
+	tomb2, err := st.GetErasedUser(ctx, "owner_D", "ext-shared")
+	if err != nil {
+		t.Fatalf("GetErasedUser after second erase: %v", err)
+	}
+	if tomb2.UserID != acc2.ID {
+		t.Fatalf("tombstone.UserID after second erase = %q, want %q (the re-provisioned account, not the first)", tomb2.UserID, acc2.ID)
+	}
+
+	// A THIRD call (replaying the now-erased second account) must hit
+	// the tombstone-idempotent-replay branch and report the
+	// re-provisioned account's id — proving the replay path always
+	// reads the LATEST tombstone, not a stale first-erase snapshot.
+	rec3 := httptest.NewRecorder()
+	srv.HandleEraseAppUser(rec3, eraseRequest(ident, "ext-shared"))
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("replay of second erase status = %d, want 200, body=%s", rec3.Code, rec3.Body.String())
+	}
+	replay := decodeReceipt(t, rec3)
+	if replay.UserID != acc2.ID {
+		t.Fatalf("replay userId = %q, want %q (must reflect the latest tombstone, not the first erase)", replay.UserID, acc2.ID)
+	}
+	if replay.DB != (store.DeleteUserCounts{}) {
+		t.Errorf("replay receipt.DB = %+v, want all-zero", replay.DB)
 	}
 }

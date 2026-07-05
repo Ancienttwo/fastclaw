@@ -21,6 +21,13 @@
 //
 // Nothing here touches the turn-scoped pool, so the existing sandbox
 // behavior is byte-for-byte unchanged: this is purely additive.
+//
+// Modified by SalesKo: tag ctx with sandbox.WithUserID at every
+// pool-touching entrypoint (Get, Up, Wake, Exec, Logs) so sandboxes
+// created through this package's preview path (upViaPool/poolExec) get
+// the same durable sandbox_bindings row / E2B metadata tag the agent
+// turn path already gets — otherwise the admin erase-user cascade's
+// KillForUser silently can't see them.
 package runtime
 
 import (
@@ -291,6 +298,12 @@ func (m *Manager) scopeFor(agentID, projectID, sessionID string) (scopeID, works
 // wake/re-up, which boots a fresh container. The stored row is left as-is;
 // the next Up reconciles it.
 func (m *Manager) Get(ctx context.Context, userID, agentID, projectID, sessionID string) (*store.ProjectRuntimeRecord, error) {
+	// Tag ctx so any future pool touch inherits the acting user — Get
+	// itself only reads the DB record + reconciles the docker live map
+	// today, but every other entrypoint below does this unconditionally
+	// so the tag is never missing depending on which call path a caller
+	// happens to hit.
+	ctx = sandbox.WithUserID(ctx, userID)
 	scopeID, _, err := m.scopeFor(agentID, projectID, sessionID)
 	if err != nil {
 		return nil, err
@@ -323,6 +336,15 @@ func (m *Manager) Get(ctx context.Context, userID, agentID, projectID, sessionID
 // templateRef may be empty when the runtime already exists (the stored
 // ref is reused); it is required on first provisioning.
 func (m *Manager) Up(ctx context.Context, userID, agentID, projectID, sessionID, templateRef string) (*store.ProjectRuntimeRecord, error) {
+	// Tag ctx with the acting user BEFORE the usesPool() branch below can
+	// call upViaPool → pool.Get. Without this, sandboxes this package
+	// creates via the HTTP /runtime/* entrypoints (internal/setup/
+	// handlers_runtime.go, which only stamp config.WithUserID — a
+	// different ctx key auth uses for its own lookups) would never
+	// receive a sandbox_bindings row, and the admin erase-user cascade's
+	// KillForUser would silently miss them until the pool's own idle
+	// eviction reaps them.
+	ctx = sandbox.WithUserID(ctx, userID)
 	scopeID, ws, err := m.scopeFor(agentID, projectID, sessionID)
 	if err != nil {
 		return nil, err
@@ -528,6 +550,10 @@ func (m *Manager) Sleep(ctx context.Context, userID, agentID, projectID, session
 
 // Wake is Up without a template ref (reuses the stored one).
 func (m *Manager) Wake(ctx context.Context, userID, agentID, projectID, sessionID string) (*store.ProjectRuntimeRecord, error) {
+	// Redundant with Up's own tagging (Up re-tags with the same value)
+	// but kept explicit here too — a reader auditing Wake shouldn't have
+	// to trust that Up does the right thing internally.
+	ctx = sandbox.WithUserID(ctx, userID)
 	return m.Up(ctx, userID, agentID, projectID, sessionID, "")
 }
 
@@ -549,6 +575,10 @@ func (m *Manager) Stop(ctx context.Context, userID, agentID, projectID, sessionI
 // snapshots, deploys, package installs the agent triggers out-of-band).
 // Returns combined stdout+stderr. Fails if the runtime isn't live.
 func (m *Manager) Exec(ctx context.Context, userID, agentID, projectID, sessionID, command string, timeout time.Duration) (string, error) {
+	// Same reasoning as Up: poolExec below calls pool.Get, which lazily
+	// (re)creates a sandbox if the cached one was evicted — this is a
+	// real create path, not just a lookup, so it needs the tag too.
+	ctx = sandbox.WithUserID(ctx, userID)
 	scopeID, _, err := m.scopeFor(agentID, projectID, sessionID)
 	if err != nil {
 		return "", err
@@ -573,6 +603,9 @@ func (m *Manager) Exec(ctx context.Context, userID, agentID, projectID, sessionI
 
 // Logs tails the dev server log. tail<=0 returns the whole file.
 func (m *Manager) Logs(ctx context.Context, userID, agentID, projectID, sessionID string, tailLines int) (string, error) {
+	// Not named in the original audit but the same gap as Exec: this
+	// also reaches poolExec → pool.Get and can lazily recreate a sandbox.
+	ctx = sandbox.WithUserID(ctx, userID)
 	scopeID, _, err := m.scopeFor(agentID, projectID, sessionID)
 	if err != nil {
 		return "", err

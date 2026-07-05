@@ -1,3 +1,6 @@
+// Added by SalesKo: DeleteUserWithCounts + erased_users tombstone tests
+// for the admin erase-user cascade.
+
 package store
 
 import (

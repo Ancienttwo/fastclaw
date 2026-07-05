@@ -1,3 +1,6 @@
+// Added by SalesKo: E2B sandbox-binding lifecycle, KillForUser, and
+// create-payload-metadata tests for the admin erase-user cascade.
+
 package sandbox
 
 import (
@@ -315,18 +318,23 @@ func TestE2BExecutorPoolRecordBindingRequiresContextUserID(t *testing.T) {
 	pool.SetBindingStore(st)
 	ex := &E2BExecutor{apiKey: "test-api-key", sandboxID: "sb-untagged"}
 
-	pool.recordBinding(context.Background(), ex, "agt_1", "agt_1:s:sess_1")
+	// Direct white-box call: no concurrent access in this test, so
+	// calling the "caller must hold p.mu" method without the lock is
+	// safe here (see recordBindingLocked's doc comment for why it
+	// doesn't lock internally — Get, its only real caller, already
+	// holds p.mu for its whole body).
+	pool.recordBindingLocked(context.Background(), ex, "agt_1", "agt_1:s:sess_1")
 
 	got, err := st.ListSandboxBindingsByUser(context.Background(), "")
 	if err != nil {
 		t.Fatalf("ListSandboxBindingsByUser(\"\"): %v", err)
 	}
 	if len(got) != 0 {
-		t.Errorf("recordBinding wrote a row despite an untagged ctx: %+v", got)
+		t.Errorf("recordBindingLocked wrote a row despite an untagged ctx: %+v", got)
 	}
 
 	tagged := WithUserID(context.Background(), "u_tagged")
-	pool.recordBinding(tagged, ex, "agt_1", "agt_1:s:sess_1")
+	pool.recordBindingLocked(tagged, ex, "agt_1", "agt_1:s:sess_1")
 	got, err = st.ListSandboxBindingsByUser(context.Background(), "u_tagged")
 	if err != nil {
 		t.Fatalf("ListSandboxBindingsByUser(u_tagged): %v", err)

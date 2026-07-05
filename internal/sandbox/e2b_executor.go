@@ -158,8 +158,17 @@ func newE2BExecutor(ctx context.Context, apiKey, template string, timeout time.D
 	}, nil
 }
 
+// e2bEnvdURLFunc builds the envd base URL for a sandbox. Overridable (see
+// SetE2BEndpointsForTest) so cross-package integration tests — e.g.
+// internal/runtime, which borrows the gateway's shared pool for its
+// preview path — can redirect Hydrate/exec traffic to a local
+// httptest.Server instead of the real *.e2b.app DNS.
+var e2bEnvdURLFunc = func(sandboxID string) string {
+	return fmt.Sprintf("https://%s-%s.e2b.app", e2bEnvdPort, sandboxID)
+}
+
 func (e *E2BExecutor) envdURL() string {
-	return fmt.Sprintf("https://%s-%s.e2b.app", e2bEnvdPort, e.sandboxID)
+	return e2bEnvdURLFunc(e.sandboxID)
 }
 
 // recreate destroys the current sandbox and creates a new one. The same
@@ -1065,24 +1074,31 @@ func (p *E2BExecutorPool) Get(ctx context.Context, agentID, projectID, sessionID
 	}
 	warmupCamoufoxDaemon(ctx, ex)
 	p.executors[key] = ex
-	p.recordBinding(ctx, ex, agentID, key)
+	p.recordBindingLocked(ctx, ex, agentID, key)
 	return ex, nil
 }
 
-// recordBinding persists the sandbox_bindings row for a freshly-created
-// sandbox, when both a binding store is configured AND the caller tagged
-// ctx with the acting user (see sandbox.WithUserID — set by
-// Agent.HandleMessage before bindSession/Get, empty for callers that
+// recordBindingLocked persists the sandbox_bindings row for a freshly-
+// created sandbox, when both a binding store is configured AND the
+// caller tagged ctx with the acting user (see sandbox.WithUserID — set
+// by Agent.HandleMessage before bindSession/Get, empty for callers that
 // don't know about chatters like cron flushes or admin reload triggers).
 // Best-effort: a write failure here only means the admin erase-user
 // cascade won't discover this specific sandbox via the binding table
 // until it's naturally recreated (idle eviction, error-triggered
 // recreate, or this same process's own Release) — it must not fail the
 // chat turn that's waiting on this sandbox.
-func (p *E2BExecutorPool) recordBinding(ctx context.Context, ex *E2BExecutor, agentID, executionRef string) {
-	p.mu.Lock()
+//
+// Caller MUST already hold p.mu. Get is the only caller and holds the
+// lock for its entire body (including the create/hydrate/verify network
+// round-trips above) — reading p.bindingStore directly here instead of
+// re-locking avoids a self-deadlock on the non-reentrant sync.Mutex
+// (caught by TestManagerExecTagsCtxSoE2BBindingAndMetadataAreRecorded,
+// which — unlike the pool-level unit tests in this package — goes
+// through the real Get() path end-to-end instead of seeding
+// p.executors/bindings directly).
+func (p *E2BExecutorPool) recordBindingLocked(ctx context.Context, ex *E2BExecutor, agentID, executionRef string) {
 	bs := p.bindingStore
-	p.mu.Unlock()
 	if bs == nil {
 		return
 	}

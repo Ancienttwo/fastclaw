@@ -1,3 +1,5 @@
+// Added by SalesKo: admin erase-user cascade endpoint.
+
 package api
 
 import (
