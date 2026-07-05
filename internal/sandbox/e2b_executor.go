@@ -2,7 +2,9 @@
 // KillForUser for the admin erase-user cascade; extracted deleteE2BSandbox
 // out of Close() so both share the same kill primitive; e2bBaseURL and
 // the pool's http.Client are now overridable so tests can point them at a
-// local httptest.Server instead of the real E2B API.
+// local httptest.Server instead of the real E2B API; newE2BExecutor now
+// tags the create payload with an optional fastclaw_user_id/agent_id/
+// execution_ref metadata map for ops-side sandbox identification.
 
 package sandbox
 
@@ -59,7 +61,30 @@ type E2BExecutor struct {
 	sessionID string
 }
 
-func newE2BExecutor(ctx context.Context, apiKey, template string, timeout time.Duration) (*E2BExecutor, error) {
+// e2bMetadata builds the optional metadata tag E2B attaches to a sandbox
+// at create time (E2B's REST API accepts a free-form string-map
+// `metadata` field). This is a SEPARATE, best-effort observability tag
+// from the sandbox_bindings store table — KillForUser enumerates via the
+// store table only, never by querying E2B's own metadata, so a failure
+// or omission here doesn't affect the erase-user cascade's correctness.
+// Its purpose is letting an operator identify orphaned sandboxes
+// straight from the E2B dashboard/API if the fastclaw DB is ever
+// unavailable. Returns nil (omit the field entirely) when ctx carries no
+// chatter userID — same "no tag, no problem" fallback as the binding
+// write.
+func e2bMetadata(ctx context.Context, agentID, executionRef string) map[string]string {
+	uid := UserIDFromContext(ctx)
+	if uid == "" {
+		return nil
+	}
+	return map[string]string{
+		"fastclaw_user_id": uid,
+		"agent_id":         agentID,
+		"execution_ref":    executionRef,
+	}
+}
+
+func newE2BExecutor(ctx context.Context, apiKey, template string, timeout time.Duration, metadata map[string]string) (*E2BExecutor, error) {
 	if template == "" {
 		template = "base"
 	}
@@ -81,10 +106,14 @@ func newE2BExecutor(ctx context.Context, apiKey, template string, timeout time.D
 	// is missing` when the field was renamed to snake_case. The
 	// snake_case form shows up in some SDK source code but the
 	// production REST API rejects it.
-	body, _ := json.Marshal(map[string]interface{}{
+	payload := map[string]interface{}{
 		"templateID": template,
 		"timeout":    int(timeout.Seconds()),
-	})
+	}
+	if len(metadata) > 0 {
+		payload["metadata"] = metadata
+	}
+	body, _ := json.Marshal(payload)
 	// Bound the create-sandbox call to 60s — the call itself usually
 	// completes in 1–2s; if it's hanging past that there's a control-
 	// plane problem and we'd rather surface a clear timeout than wait
@@ -140,7 +169,8 @@ func (e *E2BExecutor) envdURL() string {
 // /skills/<name>/ and /workspace/ stay populated across recreations.
 func (e *E2BExecutor) recreate(ctx context.Context) error {
 	slog.Info("e2b sandbox expired, recreating", "oldSandboxID", e.sandboxID)
-	newEx, err := newE2BExecutor(ctx, e.apiKey, e.template, e.timeout)
+	newEx, err := newE2BExecutor(ctx, e.apiKey, e.template, e.timeout,
+		e2bMetadata(ctx, e.agentID, poolKey(e.agentID, e.projectID, e.sessionID)))
 	if err != nil {
 		return err
 	}
@@ -1012,7 +1042,7 @@ func (p *E2BExecutorPool) Get(ctx context.Context, agentID, projectID, sessionID
 	if ex, ok := p.executors[key]; ok {
 		return ex, nil
 	}
-	ex, err := newE2BExecutor(ctx, p.apiKey, p.template, p.timeout)
+	ex, err := newE2BExecutor(ctx, p.apiKey, p.template, p.timeout, e2bMetadata(ctx, agentID, key))
 	if err != nil {
 		return nil, err
 	}

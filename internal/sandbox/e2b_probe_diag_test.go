@@ -10,6 +10,9 @@
 //
 // Build tag keeps it out of normal `go test ./...` runs — it hits a
 // paid API and creates a real sandbox.
+//
+// Modified by SalesKo: newE2BExecutor gained a metadata parameter; this
+// manual test passes nil (no chatter context to tag here).
 
 package sandbox
 
@@ -32,7 +35,7 @@ func TestE2BProbeWorkspacePerms(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	ex, err := newE2BExecutor(ctx, apiKey, template, 5*time.Minute)
+	ex, err := newE2BExecutor(ctx, apiKey, template, 5*time.Minute, nil)
 	if err != nil {
 		t.Fatalf("create sandbox: %v", err)
 	}

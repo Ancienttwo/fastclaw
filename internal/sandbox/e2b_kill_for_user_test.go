@@ -2,11 +2,13 @@ package sandbox
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/store"
 )
@@ -210,6 +212,93 @@ func TestE2BExecutorPoolReleaseClearsBinding(t *testing.T) {
 	}
 	if len(remaining) != 0 {
 		t.Errorf("bindings for u_1 after Release = %+v, want none", remaining)
+	}
+}
+
+func TestE2BMetadataOmittedWithoutContextUserID(t *testing.T) {
+	if got := e2bMetadata(context.Background(), "agt_1", "ref_1"); got != nil {
+		t.Errorf("e2bMetadata with untagged ctx = %v, want nil", got)
+	}
+}
+
+func TestE2BMetadataIncludesUserAgentAndExecutionRef(t *testing.T) {
+	ctx := WithUserID(context.Background(), "u_1")
+	got := e2bMetadata(ctx, "agt_1", "ref_1")
+	want := map[string]string{"fastclaw_user_id": "u_1", "agent_id": "agt_1", "execution_ref": "ref_1"}
+	if len(got) != len(want) {
+		t.Fatalf("e2bMetadata = %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("e2bMetadata[%s] = %q, want %q", k, got[k], v)
+		}
+	}
+}
+
+// TestNewE2BExecutorSendsMetadataInCreatePayload proves the create
+// payload actually carries the metadata map end-to-end (not just that
+// e2bMetadata builds the right value in isolation) — this is the part of
+// the erase-user cascade's E2B-side tagging that lets an operator
+// identify orphaned sandboxes from E2B's own API/dashboard if the
+// fastclaw DB is ever unavailable. It's a supplementary tag only:
+// KillForUser itself never reads this back, it enumerates via the
+// sandbox_bindings store table instead.
+func TestNewE2BExecutorSendsMetadataInCreatePayload(t *testing.T) {
+	var captured map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/sandboxes" {
+			_ = json.NewDecoder(r.Body).Decode(&captured)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"sandboxID":"sb-new","envdAccessToken":"tok"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	withMockE2BBaseURL(t, srv)
+
+	ctx := WithUserID(context.Background(), "u_meta")
+	ex, err := newE2BExecutor(ctx, "test-key", "base", time.Minute, e2bMetadata(ctx, "agt_1", "ref_1"))
+	if err != nil {
+		t.Fatalf("newE2BExecutor: %v", err)
+	}
+	if ex.sandboxID != "sb-new" {
+		t.Fatalf("sandboxID = %q, want sb-new", ex.sandboxID)
+	}
+	meta, ok := captured["metadata"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("captured create payload has no metadata field: %+v", captured)
+	}
+	if meta["fastclaw_user_id"] != "u_meta" || meta["agent_id"] != "agt_1" || meta["execution_ref"] != "ref_1" {
+		t.Errorf("metadata = %+v, want fastclaw_user_id=u_meta agent_id=agt_1 execution_ref=ref_1", meta)
+	}
+}
+
+// TestNewE2BExecutorOmitsMetadataFieldWhenNil proves the create payload
+// has NO metadata key at all for callers that pass nil (e.g. cron
+// flushes, admin reload triggers with no chatter context) — this must
+// not send an empty object that a stricter E2B API version might reject.
+func TestNewE2BExecutorOmitsMetadataFieldWhenNil(t *testing.T) {
+	var captured map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/sandboxes" {
+			_ = json.NewDecoder(r.Body).Decode(&captured)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"sandboxID":"sb-new2","envdAccessToken":"tok"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	withMockE2BBaseURL(t, srv)
+
+	if _, err := newE2BExecutor(context.Background(), "test-key", "base", time.Minute, nil); err != nil {
+		t.Fatalf("newE2BExecutor: %v", err)
+	}
+	if _, ok := captured["metadata"]; ok {
+		t.Errorf("captured create payload has a metadata key when none was passed: %+v", captured)
 	}
 }
 
