@@ -1438,6 +1438,36 @@ func synthesizeRequiredToolCallOnNoTool(resp *provider.Response, policy *require
 	return true
 }
 
+func enforceRequiredToolSequenceOnToolCalls(resp *provider.Response, policy *requiredToolSequencePolicy, params map[string]any, text string, messages []provider.Message, round int) (string, bool) {
+	if resp == nil || !resp.HasToolCalls() || policy == nil || policy.complete() {
+		return "", false
+	}
+	nextTool := policy.nextTool()
+	if nextTool == "" {
+		return "", false
+	}
+	for _, tc := range resp.ToolCalls {
+		if tc.Function.Name != nextTool {
+			continue
+		}
+		if len(resp.ToolCalls) == 1 {
+			return "", false
+		}
+		resp.Content = ""
+		resp.ToolCalls = []provider.ToolCall{tc}
+		resp.RawAssistant = nil
+		return "filtered", true
+	}
+	tc, ok := requiredSyntheticToolCall(nextTool, params, text, messages, round)
+	if !ok {
+		return "", false
+	}
+	resp.Content = ""
+	resp.ToolCalls = []provider.ToolCall{tc}
+	resp.RawAssistant = nil
+	return "synthesized", true
+}
+
 func requiredSyntheticToolCall(toolName string, params map[string]any, text string, messages []provider.Message, round int) (provider.ToolCall, bool) {
 	args, ok := requiredSyntheticToolArgs(toolName, params, text, messages)
 	if !ok {
@@ -2530,6 +2560,14 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 			slog.Warn("synthesized required tool call after no-tool response",
 				"agent", a.name,
 				"tool", resp.ToolCalls[0].Function.Name,
+				"iteration", i+1,
+			)
+		}
+		if mode, ok := enforceRequiredToolSequenceOnToolCalls(resp, requiredToolPolicy, msg.Params, msg.Text, messages, i+1); ok {
+			slog.Warn("enforced required tool sequence before tool execution",
+				"agent", a.name,
+				"tool", resp.ToolCalls[0].Function.Name,
+				"mode", mode,
 				"iteration", i+1,
 			)
 		}

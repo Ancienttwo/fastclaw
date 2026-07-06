@@ -167,6 +167,109 @@ func TestSynthesizeRequiredToolCallClearsRawAssistant(t *testing.T) {
 	}
 }
 
+func TestEnforceRequiredToolSequenceSynthesizesSubmitWhenWrongToolCalled(t *testing.T) {
+	const readTool = "mcp_salesko_graph_read_job_context"
+	const submitTool = "mcp_salesko_graph_submit_proposal"
+	policy := newRequiredToolSequencePolicy([]string{readTool, submitTool}, 2)
+	policy.markSuccessfulTool(readTool)
+	context := map[string]any{
+		"currentFrameVersion": float64(3),
+		"baseFrame": map[string]any{
+			"graph": map[string]any{
+				"nodes": []any{
+					map[string]any{"id": "person-ada", "type": "person", "label": "Ada Lovelace"},
+				},
+			},
+		},
+	}
+	contextBlob, err := json.Marshal(context)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := &provider.Response{
+		Content:      "Calling mcp_salesko_graph_submit_proposal.",
+		RawAssistant: json.RawMessage(`{"role":"assistant","content":"Calling mcp_salesko_graph_submit_proposal."}`),
+		ToolCalls: []provider.ToolCall{{
+			ID:   "call_exec",
+			Type: "function",
+			Function: provider.FunctionCall{
+				Name:      "exec",
+				Arguments: `{"command":"echo Calling mcp_salesko_graph_submit_proposal"}`,
+			},
+		}},
+	}
+	mode, ok := enforceRequiredToolSequenceOnToolCalls(resp, policy, map[string]any{
+		"salesko_job_id":         "job-1",
+		"tenant_id":              "tenant-1",
+		"dataset_scope":          "salesko",
+		"frame_record_id":        "frame-1",
+		"expected_frame_version": float64(3),
+	}, "", []provider.Message{{
+		Role:    "tool",
+		Name:    readTool,
+		Content: string(contextBlob),
+	}}, 4)
+	if !ok || mode != "synthesized" {
+		t.Fatalf("enforce = (%q, %v), want synthesized/true", mode, ok)
+	}
+	if resp.Content != "" {
+		t.Fatalf("content = %q, want cleared", resp.Content)
+	}
+	if len(resp.RawAssistant) != 0 {
+		t.Fatalf("RawAssistant was not cleared: %s", string(resp.RawAssistant))
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].Function.Name != submitTool {
+		t.Fatalf("tool calls = %#v, want only %s", resp.ToolCalls, submitTool)
+	}
+	var args map[string]any
+	if err := json.Unmarshal([]byte(resp.ToolCalls[0].Function.Arguments), &args); err != nil {
+		t.Fatalf("arguments are not JSON: %v", err)
+	}
+	if args["stop_reason"] != "provider_limit" {
+		t.Fatalf("stop_reason = %v, want provider_limit", args["stop_reason"])
+	}
+}
+
+func TestEnforceRequiredToolSequenceFiltersMixedToolBatch(t *testing.T) {
+	const readTool = "mcp_salesko_graph_read_job_context"
+	policy := newRequiredToolSequencePolicy([]string{readTool}, 2)
+	resp := &provider.Response{
+		Content:      "I will inspect files and read context.",
+		RawAssistant: json.RawMessage(`{"role":"assistant","tool_calls":[{"id":"call_exec"},{"id":"call_read"}]}`),
+		ToolCalls: []provider.ToolCall{
+			{
+				ID:   "call_exec",
+				Type: "function",
+				Function: provider.FunctionCall{
+					Name:      "exec",
+					Arguments: `{"command":"ls"}`,
+				},
+			},
+			{
+				ID:   "call_read",
+				Type: "function",
+				Function: provider.FunctionCall{
+					Name:      readTool,
+					Arguments: `{"job_id":"job-1","tenant_id":"tenant-1","frame_record_id":"frame-1"}`,
+				},
+			},
+		},
+	}
+	mode, ok := enforceRequiredToolSequenceOnToolCalls(resp, policy, nil, "", nil, 1)
+	if !ok || mode != "filtered" {
+		t.Fatalf("enforce = (%q, %v), want filtered/true", mode, ok)
+	}
+	if len(resp.ToolCalls) != 1 || resp.ToolCalls[0].ID != "call_read" {
+		t.Fatalf("tool calls = %#v, want only call_read", resp.ToolCalls)
+	}
+	if resp.Content != "" {
+		t.Fatalf("content = %q, want cleared", resp.Content)
+	}
+	if len(resp.RawAssistant) != 0 {
+		t.Fatalf("RawAssistant was not cleared: %s", string(resp.RawAssistant))
+	}
+}
+
 func TestRequiredSyntheticToolCallBuildsSubmitProposalFromReadContext(t *testing.T) {
 	context := map[string]any{
 		"currentFrameVersion": float64(3),
