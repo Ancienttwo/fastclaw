@@ -2814,6 +2814,22 @@ func (a *Agent) HandleMessage(ctx context.Context, msg bus.InboundMessage) strin
 	}
 
 	slog.Warn("max tool iterations reached — forcing final delivery", "agent", a.name, "max", a.maxToolIterations)
+
+	// Modified by SalesKo: before forcing final delivery, drain any still-
+	// incomplete required tool sequence. When a dispatched Salesko job's model
+	// burns its whole tool budget on exploratory tools (exec/read_file/…)
+	// without ever organically calling the required MCP tools, the required
+	// sequence never completes here — submit_proposal never runs, so the job's
+	// updatedAt freezes at dispatch time and it orphans. The no-tool fallback
+	// (synthesizeRequiredToolCallOnNoTool, above) only covers the zero-tool-call
+	// response; this covers "wandered on other tools until the cap". Reuse the
+	// same deterministic synthesis primitive so the job converges to a review-
+	// first proposal (never auto-applied) instead of orphaning. maxToolIterations
+	// is intentionally left unchanged.
+	if requiredToolPolicy != nil && !requiredToolPolicy.complete() {
+		messages = a.completeRequiredSequenceAtCap(ctx, sess, msg, requiredToolPolicy, messages, &totalToolCalls)
+	}
+
 	// Forced final delivery: one more LLM call with tools disabled and a
 	// nudge that tells the model to synthesize what it has. Replaces the
 	// old behavior of just returning a canned warning, which left users
@@ -2913,6 +2929,82 @@ func firstNonEmptyLine(s string) string {
 		return line
 	}
 	return ""
+}
+
+// completeRequiredSequenceAtCap drains a still-incomplete required tool
+// sequence at the iteration cap by synthesizing and executing the remaining
+// required tools with the same deterministic primitive the no-tool fallback
+// uses (requiredSyntheticToolCall). It exists so a dispatched Salesko job
+// converges to a review-first proposal instead of orphaning when the model
+// exhausts maxToolIterations on exploratory tools without ever organically
+// calling the required MCP tools. Synthesized calls run through the normal
+// executor, so submit_proposal actually persists the proposedChangeSet and
+// the job's updatedAt advances. The proposal carries the
+// deterministic_submit_fallback_used warning and stays a pending,
+// human-reviewed proposal — it is never auto-applied.
+//
+// Fail-closed: if a remaining tool can't be synthesized (missing dispatch
+// ids, or no read_job_context result to base the proposal on) or its
+// execution fails, the loop stops rather than fabricating frame data or
+// spinning. The sequence then stays incomplete and the job does not converge
+// here — the correct behavior when the authoritative frame is unavailable.
+//
+// Modified by SalesKo: added for the iteration-cap orphan fix.
+func (a *Agent) completeRequiredSequenceAtCap(
+	ctx context.Context,
+	sess *session.Session,
+	msg bus.InboundMessage,
+	policy *requiredToolSequencePolicy,
+	messages []provider.Message,
+	totalToolCalls *int,
+) []provider.Message {
+	for guard := 0; guard < len(policy.sequence) && !policy.complete(); guard++ {
+		nextTool := policy.nextTool()
+		tc, ok := requiredSyntheticToolCall(nextTool, msg.Params, msg.Text, messages, a.maxToolIterations+guard+1)
+		if !ok {
+			slog.Warn("cap: could not synthesize required tool — leaving sequence incomplete",
+				"agent", a.name, "tool", nextTool)
+			break
+		}
+		slog.Warn("cap: synthesizing required tool to avoid orphaned job",
+			"agent", a.name, "tool", nextTool, "max", a.maxToolIterations)
+
+		asst := provider.Message{
+			Role:      "assistant",
+			ToolCalls: []provider.ToolCall{tc},
+			Timestamp: time.Now().UnixMilli(),
+		}
+		sess.Append(asst)
+		messages = append(messages, asst)
+
+		results := a.engine.executeToolsConcurrently(ctx, a.registry, []provider.ToolCall{tc}, a.workspacePath)
+		for _, r := range results {
+			*totalToolCalls++
+			resultContent, meta := extractToolMeta(r.result)
+			toolMsg := provider.Message{
+				Role:       "tool",
+				Content:    resultContent,
+				ToolCallID: tc.ID,
+				Name:       r.toolName,
+				Metadata:   meta,
+			}
+			sess.Append(toolMsg)
+			messages = append(messages, toolMsg)
+			if !isFailedToolResult(r.err, resultContent) {
+				policy.markSuccessfulTool(r.toolName)
+			}
+		}
+
+		// No-progress guard: if the synthesized tool didn't advance the
+		// sequence (execution failed or the executor returned nothing), stop
+		// instead of re-synthesizing the same tool forever.
+		if policy.nextTool() == nextTool {
+			slog.Warn("cap: synthesized required tool did not advance sequence — stopping",
+				"agent", a.name, "tool", nextTool)
+			break
+		}
+	}
+	return messages
 }
 
 // padOrphanToolResults walks the session and appends a synthetic
