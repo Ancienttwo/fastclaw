@@ -103,6 +103,9 @@ func buildSystemSandboxPool(cfg config.SandboxCfg, ws workspace.Store) sandbox.E
 	// BoxliteSnapshot); fall back to the legacy shared Image slot for
 	// configs predating the split.
 	switch cfg.Backend {
+	case "cloudflare":
+		inner = sandbox.NewCloudflareExecutorPool(cfg.CloudflareURL, 30*time.Minute)
+		slog.Info("system sandbox executor pool created", "backend", "cloudflare")
 	case "e2b":
 		apiKey := cfg.E2BKey
 		if apiKey == "" {

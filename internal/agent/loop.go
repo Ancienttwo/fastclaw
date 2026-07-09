@@ -163,6 +163,14 @@ func (a *Agent) SetSandboxPool(p sandbox.ExecutorPool) {
 	}
 }
 
+// ForgetExternallyManagedSandbox drops local references after a turn whose
+// provider lifecycle is owned by an upstream orchestrator. It is a no-op for
+// pools that still own provider cleanup.
+func (a *Agent) ForgetExternallyManagedSandbox(projectID, sessionID string) bool {
+	pool, ok := a.sandboxPool.(sandbox.ExternallyManagedExecutorPool)
+	return ok && pool.ForgetExternallyManaged(a.name, projectID, sessionID)
+}
+
 // bindSession wires per-turn session state into the tool registry: the
 // session-scoped sandbox executor (when a pool is configured), the
 // sessionID workspace.Store calls use to namespace artifacts, and the

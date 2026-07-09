@@ -175,8 +175,9 @@ database and is edited through the dashboard or `fastclaw agents config`.
 | `FASTCLAW_STORAGE_DSN` | empty | Postgres DSN, e.g. `postgres://u:p@host:5432/db?sslmode=disable`. Empty = sqlite at `$FASTCLAW_HOME/fastclaw.db`. |
 | `FASTCLAW_STORAGE_AUTO_MIGRATE` | `true` | Apply schema migrations on boot. |
 | `FASTCLAW_SANDBOX_ENABLED` | dashboard | Override the Settings → Runtime toggle. |
-| `FASTCLAW_SANDBOX_BACKEND` | dashboard | `docker` or `e2b`. |
+| `FASTCLAW_SANDBOX_BACKEND` | dashboard/env | `docker`, `e2b`, `boxlite`, or `cloudflare`; the Cloudflare smoke backend is env-configured in this slice. |
 | `FASTCLAW_SANDBOX_IMAGE` | dashboard | Docker image (Docker backend) or template id (E2B). |
+| `FASTCLAW_SANDBOX_CLOUDFLARE_URL` | unset | AiphaBee-owned Cloudflare Sandbox Bridge base URL when backend is `cloudflare`. The run token is never stored in env/config. |
 | `FASTCLAW_OBJECT_STORE_*` | unset | S3-compatible blob store for distributed deploys (multi-pod skill / file hydration). |
 | `FASTCLAW_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. |
 
@@ -184,6 +185,14 @@ Anything not on this list — providers, models, default model, skill
 catalog, channels, plugin config, scheduler — is configured at runtime
 through the web UI (`http://localhost:18953`) or the CLI (`fastclaw
 agents config`, `fastclaw provider`, `fastclaw skill`).
+
+The Cloudflare backend additionally requires a run-scoped
+`X-AiphaBee-Sandbox-Authorization` header on `/v1/chat/completions`. The API
+handler removes the header after moving it into request context; it is not
+copied into `params`, model prompts, sessions, or logs. Missing authorization
+fails closed on the first sandbox tool call. For this backend, AiphaBee is the
+single provider-cleanup owner: when the turn ends FastClaw forgets the local
+executor and scrubs its token without issuing a second destroy.
 
 ## Deployment
 

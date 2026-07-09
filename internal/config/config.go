@@ -199,6 +199,9 @@ type SandboxCfg struct {
 	BoxliteClientID string `json:"boxliteClientId,omitempty"`
 	BoxliteKey      string `json:"boxliteKey,omitempty"`
 	BoxlitePrefix   string `json:"boxlitePrefix,omitempty"`
+	// CloudflareURL is the AiphaBee-owned Sandbox Bridge base URL. The
+	// per-run bearer token is request-scoped and deliberately not stored here.
+	CloudflareURL string `json:"cloudflareUrl,omitempty"`
 	Network         string `json:"network,omitempty"`
 	IdleTTLSec      int    `json:"idleTTLSec,omitempty"`
 }

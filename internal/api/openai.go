@@ -12,6 +12,7 @@ import (
 	"github.com/fastclaw-ai/fastclaw/internal/agent"
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
 	"github.com/fastclaw-ai/fastclaw/internal/bus"
+	"github.com/fastclaw-ai/fastclaw/internal/sandbox"
 	"github.com/fastclaw-ai/fastclaw/internal/users"
 )
 
@@ -174,6 +175,7 @@ const asyncChatCompletionTimeout = 15 * time.Minute
 
 // HandleChatCompletions handles POST /v1/chat/completions.
 func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	r = withSandboxAuthorization(r)
 	var req chatCompletionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -249,6 +251,12 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if sessionKey == "" {
 		sessionKey = "api-" + fmt.Sprintf("%d", time.Now().UnixNano())
 	}
+	forgetExternalSandbox := func() {
+		if sandbox.AuthorizationFromContext(r.Context()) == "" {
+			return
+		}
+		ag.ForgetExternallyManagedSandbox("", sessionKey)
+	}
 
 	// Extract the last user message
 	var userText string
@@ -323,9 +331,19 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().Unix()
 
 	if wantsAsyncChatCompletion(r) {
+		if sandbox.AuthorizationFromContext(r.Context()) != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": map[string]string{
+					"message": "respond-async is not supported for externally managed sandbox runs",
+					"type":    "invalid_request_error",
+				},
+			})
+			return
+		}
 		agentCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), asyncChatCompletionTimeout)
 		go func() {
 			defer cancel()
+			defer forgetExternalSandbox()
 			reply := ag.HandleMessage(agentCtx, buildMessage(agentCtx))
 			slog.Info("async chat completion finished",
 				"agent", ag.Name(),
@@ -338,6 +356,7 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	defer forgetExternalSandbox()
 	msg := buildMessage(r.Context())
 	isStream := req.Stream != nil && *req.Stream
 	if isStream {
@@ -347,6 +366,17 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		reply := ag.HandleMessage(r.Context(), msg)
 		s.fullResponse(w, reply, chatID, model, now)
 	}
+}
+
+func withSandboxAuthorization(r *http.Request) *http.Request {
+	token := strings.TrimSpace(r.Header.Get(sandbox.AiphaBeeSandboxAuthorizationHeader))
+	if token == "" {
+		return r
+	}
+	// Remove the transport header after copying it into context. Downstream
+	// request inspection cannot accidentally persist or log the raw token.
+	r.Header.Del(sandbox.AiphaBeeSandboxAuthorizationHeader)
+	return r.WithContext(sandbox.WithAuthorization(r.Context(), token))
 }
 
 func wantsAsyncChatCompletion(r *http.Request) bool {

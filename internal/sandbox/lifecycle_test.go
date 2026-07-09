@@ -40,7 +40,7 @@ func (f *fakeExecutor) WriteFile(ctx context.Context, p, c string) (string, erro
 	return "", nil
 }
 func (f *fakeExecutor) ListDir(ctx context.Context, path string) (string, error) { return "", nil }
-func (f *fakeExecutor) Backend() string                                           { return "fake" }
+func (f *fakeExecutor) Backend() string                                          { return "fake" }
 func (f *fakeExecutor) Close() error {
 	atomic.AddInt32(&f.closed, 1)
 	return nil
@@ -86,6 +86,17 @@ func (p *fakePool) CloseAll() {
 		ex.Close()
 		delete(p.live, id)
 	}
+}
+
+type externalFakePool struct {
+	*fakePool
+	forgotten int32
+}
+
+func (p *externalFakePool) ForgetExternallyManaged(agentID, projectID, sessionID string) bool {
+	atomic.AddInt32(&p.forgotten, 1)
+	delete(p.live, poolKey(agentID, projectID, sessionID))
+	return true
 }
 
 // TestLifecycle_LazyCreation proves that calling Get on the LifecyclePool
@@ -148,6 +159,28 @@ func TestLifecycle_IdleEviction(t *testing.T) {
 	ex.Exec(context.Background(), "ls", time.Second)
 	if got := atomic.LoadInt32(&inner.creates); got != 2 {
 		t.Fatalf("expected 2 creates (first + after eviction); got %d", got)
+	}
+}
+
+func TestLifecycle_ForgetsExternallyManagedScopeWithoutProviderRelease(t *testing.T) {
+	inner := &externalFakePool{fakePool: newFakePool()}
+	lp := NewLifecyclePool(inner, 50*time.Millisecond, 20*time.Millisecond)
+	lp.Start()
+	defer lp.CloseAll()
+
+	ex, _ := lp.Get(context.Background(), "external", "", "session")
+	if _, err := ex.Exec(context.Background(), "true", time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if !lp.ForgetExternallyManaged("external", "", "session") {
+		t.Fatal("externally managed scope was not forgotten")
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := atomic.LoadInt32(&inner.releases); got != 0 {
+		t.Fatalf("provider release calls = %d, want 0", got)
+	}
+	if got := atomic.LoadInt32(&inner.forgotten); got != 1 {
+		t.Fatalf("forget calls = %d, want 1", got)
 	}
 }
 

@@ -20,7 +20,7 @@ type Executor interface {
 	// ListDir lists a directory and returns a human-readable listing.
 	ListDir(ctx context.Context, path string) (string, error)
 	// Backend returns the short identifier of the underlying provider
-	// ("docker", "e2b", "boxlite"). Used for log lines so operators can
+	// ("docker", "e2b", "boxlite", "cloudflare"). Used for log lines so operators can
 	// confirm at a glance which provider handled a given exec.
 	Backend() string
 	// Close destroys the sandbox and releases resources.
@@ -43,10 +43,18 @@ type ExecutorPool interface {
 	Release(agentID, projectID, sessionID string) error
 	CloseAll()
 	// Backend returns the short identifier of the underlying provider
-	// ("docker", "e2b", "boxlite"). Mirrors Executor.Backend so callers
+	// ("docker", "e2b", "boxlite", "cloudflare"). Mirrors Executor.Backend so callers
 	// holding a pool handle don't have to lazily resolve an executor
 	// just to learn the provider name.
 	Backend() string
+}
+
+// ExternallyManagedExecutorPool is implemented by provider pools whose
+// lifecycle owner lives outside FastClaw. ForgetExternallyManaged drops only
+// local references after a turn; the external orchestrator remains solely
+// responsible for provider destroy and terminal readback.
+type ExternallyManagedExecutorPool interface {
+	ForgetExternallyManaged(agentID, projectID, sessionID string) bool
 }
 
 // WorkspaceSnapshotter is an optional capability an Executor can implement

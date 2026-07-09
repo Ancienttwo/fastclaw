@@ -33,13 +33,14 @@ type EnvStorage struct {
 
 type EnvSandbox struct {
 	Enabled         bool   // FASTCLAW_SANDBOX_ENABLED
-	Backend         string // FASTCLAW_SANDBOX_BACKEND  — "docker", "e2b", or "boxlite"
+	Backend         string // FASTCLAW_SANDBOX_BACKEND  — "docker", "e2b", "boxlite", or "cloudflare"
 	Image           string // FASTCLAW_SANDBOX_IMAGE
 	E2BKey          string // E2B_API_KEY
 	BoxliteURL      string // FASTCLAW_SANDBOX_BOXLITE_URL — full base URL e.g. https://api.boxlite.ai/v1
 	BoxliteClientID string // FASTCLAW_SANDBOX_BOXLITE_CLIENT_ID — default "default"
 	BoxliteKey      string // BOXLITE_API_KEY — apikey sent as Authorization: Bearer
 	BoxlitePrefix   string // FASTCLAW_SANDBOX_BOXLITE_PREFIX — workspace prefix, default "default"
+	CloudflareURL   string // FASTCLAW_SANDBOX_CLOUDFLARE_URL — AiphaBee Sandbox Bridge base URL
 }
 
 type EnvLog struct {
@@ -101,6 +102,9 @@ func LoadEnv() *EnvConfig {
 	}
 	if v := os.Getenv("FASTCLAW_SANDBOX_BOXLITE_PREFIX"); v != "" {
 		cfg.Sandbox.BoxlitePrefix = v
+	}
+	if v := os.Getenv("FASTCLAW_SANDBOX_CLOUDFLARE_URL"); v != "" {
+		cfg.Sandbox.CloudflareURL = v
 	}
 
 	if v := os.Getenv("FASTCLAW_LOG_LEVEL"); v != "" {
@@ -226,6 +230,9 @@ func (e *EnvConfig) ApplyToConfig(cfg *Config) {
 		}
 		if e.Sandbox.BoxlitePrefix != "" {
 			cfg.Sandbox.BoxlitePrefix = e.Sandbox.BoxlitePrefix
+		}
+		if e.Sandbox.CloudflareURL != "" {
+			cfg.Sandbox.CloudflareURL = e.Sandbox.CloudflareURL
 		}
 	}
 	applyObjectStoreEnv(cfg)

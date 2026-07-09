@@ -152,7 +152,7 @@ template ships out of the box — `vite-react`, a plain Vite + React + TS
 starter that self-scaffolds with `npm create vite` (no baked `/template`, no
 source fetch) — as a worked example of multi-template support.
 
-## Sandbox backends (docker vs e2b/boxlite)
+## Sandbox backends (docker vs remote providers)
 
 The preview path depends on `FASTCLAW_SANDBOX_BACKEND`:
 
@@ -165,6 +165,13 @@ The preview path depends on `FASTCLAW_SANDBOX_BACKEND`:
   (e2b: `https://<port>-<sandboxID>.e2b.app`). Coding writes route to
   `workspace.Store`; for a remote-workspace backend they're additionally
   mirrored into the live sandbox so the dev server sees them.
+- **cloudflare (AiphaBee Bridge)** — implements the same file/exec
+  `ExecutorPool` contract for short-lived research runs. It is run-token
+  scoped and intentionally does not implement `PortExposer`, so coding-agent
+  live preview fails closed instead of exposing a service from the sandbox.
+  Different scope creates run concurrently; same-scope creates coalesce. At
+  turn completion FastClaw forgets/scrubs the local executor while AiphaBee
+  alone owns Bridge evidence readback and provider destroy.
 
 ### Cloud template provisioning (where `/template` comes from)
 
