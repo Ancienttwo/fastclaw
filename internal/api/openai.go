@@ -196,13 +196,22 @@ func (s *Server) HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Header X-Fastclaw-End-User does the same job pre-handler in the
 	// auth middleware; we run this *after* the middleware so the body
 	// value wins iff both are present (the body field is more
-	// specific to this call than a static header). Errors here are
-	// non-fatal — request continues under the unswitched identity.
+	// specific to this call than a static header). Errors are terminal:
+	// continuing under the unswitched owner would cross the app-user
+	// isolation boundary.
 	if req.User != "" && s.authResolver != nil {
 		if ident, ok := auth.FromContext(r.Context()); ok {
-			if next, swErr := s.authResolver.SwitchToAppUser(r.Context(), ident, req.User); swErr == nil {
-				r = r.WithContext(auth.WithIdentity(r.Context(), next))
+			next, swErr := s.authResolver.SwitchToAppUser(r.Context(), ident, req.User)
+			if swErr != nil {
+				writeJSON(w, http.StatusForbidden, map[string]any{
+					"error": map[string]string{
+						"message": "end-user identity is unavailable",
+						"type":    "authentication_error",
+					},
+				})
+				return
 			}
+			r = r.WithContext(auth.WithIdentity(r.Context(), next))
 		}
 	}
 

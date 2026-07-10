@@ -406,15 +406,16 @@ done:
 	}
 	// If the calling app named an end-user via X-Fastclaw-End-User on an
 	// api_key request, rebind to the corresponding app_user (lazy mint).
-	// We swallow errors here so a malformed header can't 401 a request —
-	// the request just stays under the api_key owner. The OpenAI
-	// /v1/chat/completions handler also honors `user` in the request
-	// body for clients that prefer the OpenAI shape; that path calls
-	// SwitchToAppUser explicitly after parsing the body.
+	// A failed switch is terminal. Continuing as the API-key owner would
+	// collapse the tenant boundary precisely when the requested end-user is
+	// disabled or unavailable. The OpenAI body-field path applies the same
+	// rule after parsing.
 	if eu := strings.TrimSpace(req.Header.Get(EndUserHeader)); eu != "" {
-		if next, swErr := r.SwitchToAppUser(req.Context(), ident, eu); swErr == nil {
-			ident = next
+		next, swErr := r.SwitchToAppUser(req.Context(), ident, eu)
+		if swErr != nil {
+			return Identity{}, swErr
 		}
+		ident = next
 	}
 	return ident, nil
 }

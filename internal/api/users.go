@@ -2,10 +2,12 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/fastclaw-ai/fastclaw/internal/auth"
+	"github.com/fastclaw-ai/fastclaw/internal/users"
 )
 
 // HandleProvisionAppUser handles POST /v1/users.
@@ -58,6 +60,12 @@ func (s *Server) HandleProvisionAppUser(w http.ResponseWriter, r *http.Request) 
 	// pure provisioning call, not a passthrough.
 	switched, err := s.authResolver.SwitchToAppUser(r.Context(), ident, req.ExternalID)
 	if err != nil {
+		if errors.Is(err, users.ErrAccountDisabled) {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": map[string]string{"message": "end-user identity is disabled", "type": "authentication_error"},
+			})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": map[string]string{"message": err.Error(), "type": "server_error"},
 		})

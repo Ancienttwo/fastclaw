@@ -186,12 +186,12 @@ type onboardRequest struct {
 	Password    string `json:"password"`
 	DisplayName string `json:"displayName,omitempty"`
 
-	Provider  string `json:"provider"`
-	APIBase   string `json:"apiBase"`
-	APIKey    string `json:"apiKey"`
-	APIType   string `json:"apiType,omitempty"`
-	AuthType  string `json:"authType,omitempty"`
-	Model     string `json:"model"`
+	Provider string `json:"provider"`
+	APIBase  string `json:"apiBase"`
+	APIKey   string `json:"apiKey"`
+	APIType  string `json:"apiType,omitempty"`
+	AuthType string `json:"authType,omitempty"`
+	Model    string `json:"model"`
 
 	AgentName string `json:"agentName,omitempty"`
 
@@ -436,16 +436,19 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
+	s.invalidateUser(id)
 	jsonResponse(w, http.StatusOK, map[string]any{"user": acct})
 }
 
 func (s *Server) handleDeleteUser(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := s.accounts.Delete(r.Context(), id); err != nil {
+	deleted, err := s.accounts.Delete(r.Context(), id)
+	if err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	jsonResponse(w, http.StatusOK, map[string]any{"ok": true})
+	s.invalidateUser(id)
+	jsonResponse(w, http.StatusOK, map[string]any{"ok": true, "deleted": deleted})
 }
 
 type resetPasswordReq struct {
@@ -653,6 +656,9 @@ type adminCreateUserAgentReq struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	Model       string `json:"model,omitempty"`
+	// ExternalID is the upstream application's stable Agent identity.
+	// When present, creation is idempotent within the target user.
+	ExternalID string `json:"externalId,omitempty"`
 	// ForkFrom is an optional source agent id. When set, the new agent
 	// inherits SOUL.md / IDENTITY.md / AGENTS.md / BOOTSTRAP.md /
 	// TOOLS.md / HEARTBEAT.md / agent.json from the source's owner-row,
@@ -695,6 +701,15 @@ func (s *Server) handleCreateUserAgent(w http.ResponseWriter, r *http.Request) {
 	var req adminCreateUserAgentReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	req.ExternalID = strings.TrimSpace(req.ExternalID)
+	if req.ExternalID != "" && !isAdmin {
+		jsonResponse(w, http.StatusForbidden, map[string]any{"error": "externalId requires platform admin authority"})
+		return
+	}
+	if len(req.ExternalID) > 200 {
+		jsonResponse(w, http.StatusBadRequest, map[string]any{"error": "externalId must not exceed 200 bytes"})
 		return
 	}
 
@@ -744,14 +759,45 @@ func (s *Server) handleCreateUserAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec := &store.AgentRecord{
-		ID:     id,
-		UserID: targetUserID,
-		Name:   name,
+		ID:         id,
+		UserID:     targetUserID,
+		ExternalID: req.ExternalID,
+		Name:       name,
+	}
+	if req.ExternalID != "" {
+		rec.Config = map[string]interface{}{
+			"provisioningComplete":   false,
+			"provisioningTemplateId": req.ForkFrom,
+		}
 	}
 	if description != "" {
-		rec.Config = map[string]interface{}{"description": description}
+		if rec.Config == nil {
+			rec.Config = map[string]interface{}{}
+		}
+		rec.Config["description"] = description
 	}
-	if err := s.dataStore.SaveAgent(r.Context(), rec); err != nil {
+	created := true
+	if req.ExternalID != "" {
+		var createErr error
+		rec, created, createErr = s.dataStore.CreateAgentIdempotent(r.Context(), rec)
+		if createErr != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": createErr.Error()})
+			return
+		}
+		if existingTemplate, _ := rec.Config["provisioningTemplateId"].(string); existingTemplate != req.ForkFrom {
+			jsonResponse(w, http.StatusConflict, map[string]any{
+				"error": "externalId already exists with a different forkFrom",
+			})
+			return
+		}
+		if complete, _ := rec.Config["provisioningComplete"].(bool); complete {
+			jsonResponse(w, http.StatusOK, map[string]any{
+				"agent":   adminAgentProvisioningResponse(rec, description, s.agentScopeModel(r, rec.ID)),
+				"created": false,
+			})
+			return
+		}
+	} else if err := s.dataStore.SaveAgent(r.Context(), rec); err != nil {
 		jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -761,7 +807,7 @@ func (s *Server) handleCreateUserAgent(w http.ResponseWriter, r *http.Request) {
 		model = s.agentScopeModel(r, source.ID)
 	}
 	if model != "" {
-		if err := s.saveAgentScopeModel(r, id, model); err != nil {
+		if err := s.saveAgentScopeModel(r, rec.ID, model); err != nil {
 			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": "save model: " + err.Error()})
 			return
 		}
@@ -774,18 +820,38 @@ func (s *Server) handleCreateUserAgent(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if req.ExternalID != "" {
+		if rec.Config == nil {
+			rec.Config = map[string]interface{}{}
+		}
+		rec.Config["provisioningComplete"] = true
+		if err := s.dataStore.SaveAgent(r.Context(), rec); err != nil {
+			jsonResponse(w, http.StatusInternalServerError, map[string]any{"error": "finalize provisioning: " + err.Error()})
+			return
+		}
+	}
 
 	s.invalidateUser(targetUserID)
-	jsonResponse(w, http.StatusCreated, map[string]any{
-		"agent": map[string]any{
-			"id":          rec.ID,
-			"userId":      rec.UserID,
-			"name":        rec.Name,
-			"description": description,
-			"model":       model,
-			"isPublic":    rec.IsPublic,
-		},
+	status := http.StatusCreated
+	if !created {
+		status = http.StatusOK
+	}
+	jsonResponse(w, status, map[string]any{
+		"agent":   adminAgentProvisioningResponse(rec, description, model),
+		"created": created,
 	})
+}
+
+func adminAgentProvisioningResponse(rec *store.AgentRecord, description, model string) map[string]any {
+	return map[string]any{
+		"id":          rec.ID,
+		"userId":      rec.UserID,
+		"externalId":  rec.ExternalID,
+		"name":        rec.Name,
+		"description": description,
+		"model":       model,
+		"isPublic":    rec.IsPublic,
+	}
 }
 
 // forkAgentFiles is the allowlist of files copied during fork. These

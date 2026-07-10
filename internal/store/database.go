@@ -115,6 +115,9 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 	if err := d.migrateAgentsAddIsPublic(ctx); err != nil {
 		return fmt.Errorf("migrate agents.is_public: %w", err)
 	}
+	if err := d.migrateAgentsAddExternalID(ctx); err != nil {
+		return fmt.Errorf("migrate agents.external_id: %w", err)
+	}
 	if err := d.migrateDropAgentGrants(ctx); err != nil {
 		return fmt.Errorf("migrate drop agent_grants: %w", err)
 	}
@@ -179,7 +182,7 @@ func (d *DBStore) Migrate(ctx context.Context) error {
 //
 // Empty default + partial indexes preserve existing query plans for
 // rows written before this column existed. Readers that want the
-// chatter should COALESCE(NULLIF(chatter_user_id,''), user_id) — the
+// chatter should COALESCE(NULLIF(chatter_user_id,”), user_id) — the
 // fallback is exactly right for the web channel (user_id was already
 // the chatter there) and matches the pre-fix behavior on IM (where
 // every chatter was mis-attributed to the channel owner anyway).
@@ -219,7 +222,7 @@ func (d *DBStore) migrateSessionsAddChatterUserID(ctx context.Context) error {
 }
 
 // migrateAgentGoalsAddRouting retrofits channel/account_id/chat_id/
-// project_id onto legacy agent_goals tables. All four default to ''
+// project_id onto legacy agent_goals tables. All four default to ”
 // — pre-existing rows had no continuation infrastructure attached
 // anyway, so the empty value just means "no routing recorded; can't
 // auto-continue this goal" and TryFireContinuation bails safely.
@@ -520,7 +523,7 @@ func (d *DBStore) migrateConfigsAddScopeColumn(ctx context.Context) error {
 // (user_id, agent_id) into a single lookup key: whichever is non-empty
 // wins (they're mutually exclusive for provider/setting rows — the only
 // kinds that remain in configs now that channels have their own table).
-// System rows get scope_id=''.
+// System rows get scope_id=”.
 //
 // Idempotent: skips the ALTER if the column already exists and only
 // backfills rows where scope_id is still empty.
@@ -902,6 +905,27 @@ func (d *DBStore) migrateAgentsAddIsPublic(ctx context.Context) error {
 		return fmt.Errorf("add is_public: %w", err)
 	}
 	return nil
+}
+
+// migrateAgentsAddExternalID adds the upstream application's stable Agent
+// identity. The partial unique index is owner-scoped: the same external id may
+// exist under two different FastClaw users, but one owner can never receive two
+// Agents for the same provisioning request across retries or concurrent pods.
+func (d *DBStore) migrateAgentsAddExternalID(ctx context.Context) error {
+	has, err := d.tableHasColumn(ctx, "agents", "external_id")
+	if err != nil {
+		return err
+	}
+	if !has {
+		if _, err := d.db.ExecContext(ctx,
+			`ALTER TABLE agents ADD COLUMN external_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return err
+		}
+	}
+	_, err = d.db.ExecContext(ctx,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_owner_external
+		 ON agents (user_id, external_id) WHERE external_id <> ''`)
+	return err
 }
 
 // migrateDropAgentGrants removes the legacy per-user share table.
@@ -1457,6 +1481,7 @@ func (d *DBStore) migrationSQL() []string {
 		`CREATE TABLE IF NOT EXISTS agents (
 			id TEXT PRIMARY KEY,
 			user_id TEXT NOT NULL,
+			external_id TEXT NOT NULL DEFAULT '',
 			name TEXT NOT NULL DEFAULT '',
 			config TEXT NOT NULL DEFAULT '{}',
 			is_public BOOLEAN NOT NULL DEFAULT FALSE,
@@ -1983,7 +2008,8 @@ func (d *DBStore) DeleteUser(ctx context.Context, id string) error {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx,
-			fmt.Sprintf("DELETE FROM configs WHERE agent_id = %s", d.ph(1)), aid); err != nil {
+			fmt.Sprintf("DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s", d.ph(1), d.ph(2)),
+			aid, "%/"+aid); err != nil {
 			return err
 		}
 	}
@@ -2002,7 +2028,8 @@ func (d *DBStore) DeleteUser(ctx context.Context, id string) error {
 	// ('user_id=X, agent_id="') and any per-agent overrides they
 	// authored on someone else's agent ('user_id=X, agent_id=Y').
 	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf("DELETE FROM configs WHERE user_id = %s", d.ph(1)), id); err != nil {
+		fmt.Sprintf("DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s", d.ph(1), d.ph(2)),
+		id, id+"/%"); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -2189,7 +2216,7 @@ func (d *DBStore) APIKeyCanAccessAgent(ctx context.Context, apikeyID, agentID st
 
 // --- Agents ---
 
-const agentSelectCols = `id, user_id, name, config, is_public, created_at, updated_at`
+const agentSelectCols = `id, user_id, external_id, name, config, is_public, created_at, updated_at`
 
 func (d *DBStore) ListAgents(ctx context.Context, ownerUserID string) ([]AgentRecord, error) {
 	rows, err := d.db.QueryContext(ctx,
@@ -2207,11 +2234,72 @@ func (d *DBStore) GetAgent(ctx context.Context, agentID string) (*AgentRecord, e
 		fmt.Sprintf(`SELECT `+agentSelectCols+` FROM agents WHERE id = %s`, d.ph(1)), agentID)
 	var ag AgentRecord
 	var cfgStr string
-	if err := row.Scan(&ag.ID, &ag.UserID, &ag.Name, &cfgStr, &ag.IsPublic, &ag.CreatedAt, &ag.UpdatedAt); err != nil {
+	if err := row.Scan(&ag.ID, &ag.UserID, &ag.ExternalID, &ag.Name, &cfgStr, &ag.IsPublic, &ag.CreatedAt, &ag.UpdatedAt); err != nil {
 		return nil, scanErr(err)
 	}
 	json.Unmarshal([]byte(cfgStr), &ag.Config)
 	return &ag, nil
+}
+
+func (d *DBStore) GetAgentByExternal(ctx context.Context, ownerUserID, externalID string) (*AgentRecord, error) {
+	if strings.TrimSpace(ownerUserID) == "" || strings.TrimSpace(externalID) == "" {
+		return nil, ErrNotFound
+	}
+	row := d.db.QueryRowContext(ctx,
+		fmt.Sprintf(`SELECT `+agentSelectCols+` FROM agents WHERE user_id = %s AND external_id = %s LIMIT 1`, d.ph(1), d.ph(2)),
+		ownerUserID, externalID)
+	var ag AgentRecord
+	var cfgStr string
+	if err := row.Scan(&ag.ID, &ag.UserID, &ag.ExternalID, &ag.Name, &cfgStr, &ag.IsPublic, &ag.CreatedAt, &ag.UpdatedAt); err != nil {
+		return nil, scanErr(err)
+	}
+	json.Unmarshal([]byte(cfgStr), &ag.Config)
+	return &ag, nil
+}
+
+// CreateAgentIdempotent creates an Agent exactly once for an owner/external-id
+// pair. It is deliberately create-only: callers resume any post-create clone
+// work against the returned record and use SaveAgent only after that work is
+// complete. A unique-index race is resolved by reading the winner.
+func (d *DBStore) CreateAgentIdempotent(ctx context.Context, agent *AgentRecord) (*AgentRecord, bool, error) {
+	if agent == nil || agent.ID == "" {
+		return nil, false, errors.New("store: agent.id is required")
+	}
+	if agent.UserID == "" {
+		return nil, false, errors.New("store: agent.user_id is required")
+	}
+	agent.ExternalID = strings.TrimSpace(agent.ExternalID)
+	if agent.ExternalID == "" {
+		return nil, false, errors.New("store: agent.external_id is required for idempotent create")
+	}
+	if existing, err := d.GetAgentByExternal(ctx, agent.UserID, agent.ExternalID); err == nil {
+		return existing, false, nil
+	} else if !errors.Is(err, ErrNotFound) {
+		return nil, false, err
+	}
+	cfgData, _ := json.Marshal(agent.Config)
+	now := time.Now().UTC()
+	if agent.CreatedAt.IsZero() {
+		agent.CreatedAt = now
+	}
+	agent.UpdatedAt = now
+	query := `INSERT INTO agents (id, user_id, external_id, name, config, is_public, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+	if d.dialect == "postgres" {
+		query = `INSERT INTO agents (id, user_id, external_id, name, config, is_public, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`
+	}
+	_, err := d.db.ExecContext(ctx, query, agent.ID, agent.UserID, agent.ExternalID, agent.Name,
+		string(cfgData), agent.IsPublic, agent.CreatedAt, agent.UpdatedAt)
+	if err == nil {
+		return agent, true, nil
+	}
+	if isUniqueViolation(err) {
+		if existing, readErr := d.GetAgentByExternal(ctx, agent.UserID, agent.ExternalID); readErr == nil {
+			return existing, false, nil
+		}
+	}
+	return nil, false, err
 }
 
 func (d *DBStore) SaveAgent(ctx context.Context, agent *AgentRecord) error {
@@ -2229,21 +2317,21 @@ func (d *DBStore) SaveAgent(ctx context.Context, agent *AgentRecord) error {
 	agent.UpdatedAt = now
 	if d.dialect == "postgres" {
 		_, err := d.db.ExecContext(ctx,
-			`INSERT INTO agents (id, user_id, name, config, is_public, created_at, updated_at)
-				VALUES ($1, $2, $3, $4, $5, $6, $7)
+			`INSERT INTO agents (id, user_id, external_id, name, config, is_public, created_at, updated_at)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 				ON CONFLICT (id) DO UPDATE
-				SET user_id=$2, name=$3, config=$4, is_public=$5, updated_at=$7`,
-			agent.ID, agent.UserID, agent.Name, string(cfgData), agent.IsPublic, agent.CreatedAt, agent.UpdatedAt)
+				SET user_id=$2, external_id=$3, name=$4, config=$5, is_public=$6, updated_at=$8`,
+			agent.ID, agent.UserID, agent.ExternalID, agent.Name, string(cfgData), agent.IsPublic, agent.CreatedAt, agent.UpdatedAt)
 		return err
 	}
 	_, err := d.db.ExecContext(ctx,
-		`INSERT INTO agents (id, user_id, name, config, is_public, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO agents (id, user_id, external_id, name, config, is_public, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT (id) DO UPDATE SET
-			  user_id=excluded.user_id, name=excluded.name,
-			  config=excluded.config, is_public=excluded.is_public,
+			  user_id=excluded.user_id, external_id=excluded.external_id,
+			  name=excluded.name, config=excluded.config, is_public=excluded.is_public,
 			  updated_at=excluded.updated_at`,
-		agent.ID, agent.UserID, agent.Name, string(cfgData), agent.IsPublic, agent.CreatedAt, agent.UpdatedAt)
+		agent.ID, agent.UserID, agent.ExternalID, agent.Name, string(cfgData), agent.IsPublic, agent.CreatedAt, agent.UpdatedAt)
 	return err
 }
 
@@ -2268,7 +2356,8 @@ func (d *DBStore) DeleteAgent(ctx context.Context, agentID string) error {
 	// (user_id=owner, agent_id=X), and any non-owner per-agent
 	// overrides (user_id=other, agent_id=X).
 	if _, err := tx.ExecContext(ctx,
-		fmt.Sprintf(`DELETE FROM configs WHERE agent_id = %s`, d.ph(1)), agentID); err != nil {
+		fmt.Sprintf(`DELETE FROM configs WHERE scope_id = %s OR scope_id LIKE %s`, d.ph(1), d.ph(2)),
+		agentID, "%/"+agentID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx,
@@ -2293,7 +2382,7 @@ func scanAgents(rows *sql.Rows) ([]AgentRecord, error) {
 	for rows.Next() {
 		var ag AgentRecord
 		var cfgStr string
-		if err := rows.Scan(&ag.ID, &ag.UserID, &ag.Name, &cfgStr, &ag.IsPublic, &ag.CreatedAt, &ag.UpdatedAt); err != nil {
+		if err := rows.Scan(&ag.ID, &ag.UserID, &ag.ExternalID, &ag.Name, &cfgStr, &ag.IsPublic, &ag.CreatedAt, &ag.UpdatedAt); err != nil {
 			return nil, err
 		}
 		json.Unmarshal([]byte(cfgStr), &ag.Config)
@@ -2703,7 +2792,7 @@ func (d *DBStore) ListSessionMessages(ctx context.Context, userID, agentID, sess
 //
 // Filter is strictly on chatter_user_id (no fallback to user_id). Old
 // rows written before the chatter_user_id column existed have it set
-// to '' and are not counted; those predate per-chatter resolution and
+// to ” and are not counted; those predate per-chatter resolution and
 // folding them in would over-count (they're keyed by channel owner,
 // not the actual chatter). New conversations write chatter_user_id
 // correctly so this is only a concern for sessions migrated from
@@ -3255,9 +3344,9 @@ func (d *DBStore) migrateChannelsFromConfigs(ctx context.Context) error {
 		// Each config row may have multiple accounts in its data JSON.
 		// Extract them and create one channel row per account.
 		var cc struct {
-			BotToken string                       `json:"botToken"`
-			BaseURL  string                       `json:"baseUrl"`
-			Accounts map[string]json.RawMessage   `json:"accounts"`
+			BotToken string                     `json:"botToken"`
+			BaseURL  string                     `json:"baseUrl"`
+			Accounts map[string]json.RawMessage `json:"accounts"`
 		}
 		if blob, merr := json.Marshal(cfg.Data); merr == nil {
 			_ = json.Unmarshal(blob, &cc)
