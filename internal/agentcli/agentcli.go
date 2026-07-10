@@ -38,6 +38,10 @@ type InitOptions struct {
 	// AgentID overrides the auto-derived id. Set this to update an agent
 	// originally created via the dashboard.
 	AgentID string
+	// Ensure permits --id to create that exact agent id when it does not
+	// exist yet. It keeps bootstrap idempotent without weakening the default
+	// create-only and update-only semantics of agents init.
+	Ensure bool
 
 	Provider  string
 	Model     string
@@ -72,6 +76,9 @@ type InitResult struct {
 func Init(ctx context.Context, st store.Store, name string, opts InitOptions) (*InitResult, error) {
 	if err := validateName(name); err != nil {
 		return nil, err
+	}
+	if opts.Ensure && opts.AgentID == "" {
+		return nil, errors.New("ensure requires an explicit agent id")
 	}
 	displayName := strings.TrimSpace(name)
 
@@ -232,6 +239,19 @@ func lookupAgent(ctx context.Context, st store.Store, displayName string, opts I
 	if opts.AgentID != "" {
 		rec, err := st.GetAgent(ctx, opts.AgentID)
 		if errors.Is(err, store.ErrNotFound) {
+			if opts.Ensure {
+				if err := validateAgentIDForCreate(opts.AgentID); err != nil {
+					return nil, err
+				}
+				byName, nameErr := findAgentByName(ctx, st, displayName)
+				if nameErr != nil {
+					return nil, nameErr
+				}
+				if byName != nil {
+					return nil, fmt.Errorf("agent %q already exists with id %s; refusing to replace it with %s", displayName, byName.ID, opts.AgentID)
+				}
+				return nil, nil
+			}
 			return nil, fmt.Errorf("agent id %q not found", opts.AgentID)
 		}
 		if err != nil {
@@ -265,9 +285,13 @@ func writeAgent(ctx context.Context, st store.Store, existing *store.AgentRecord
 		}
 		return existing, false, nil
 	}
-	id, err := generateAgentID()
-	if err != nil {
-		return nil, false, err
+	id := opts.AgentID
+	if id == "" {
+		var err error
+		id, err = generateAgentID()
+		if err != nil {
+			return nil, false, err
+		}
 	}
 	rec := &store.AgentRecord{
 		ID:     id,
@@ -282,6 +306,18 @@ func writeAgent(ctx context.Context, st store.Store, existing *store.AgentRecord
 		return nil, false, err
 	}
 	return rec, true, nil
+}
+
+func validateAgentIDForCreate(id string) error {
+	if !strings.HasPrefix(id, "agt_") || len(id) <= len("agt_") || len(id) > 68 {
+		return fmt.Errorf("agent id %q is invalid", id)
+	}
+	for _, r := range id[len("agt_"):] {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '_' && r != '-' {
+			return fmt.Errorf("agent id %q is invalid", id)
+		}
+	}
+	return nil
 }
 
 // loadAccount reads the user account for an existing agent. Used on
@@ -709,7 +745,7 @@ var systemSettingNamespaces = []string{
 // Agent-scope keys cover model/temperature/sandbox; everything else is
 // a system-wide namespace. The bool return is "isAgentScope" — true
 // means the row's agent_id should be set to the active agentID; false
-// means a system row (user_id='', agent_id='').
+// means a system row (user_id=”, agent_id=”).
 func settingKey(key string) (string, []string, bool, error) {
 	if ns, ok := agentScopeKeys[key]; ok {
 		path := []string{key}

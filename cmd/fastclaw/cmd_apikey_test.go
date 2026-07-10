@@ -15,6 +15,7 @@ func TestApikeyCmd_Structure(t *testing.T) {
 
 	subcommands := map[string]bool{
 		"create": false,
+		"ensure": false,
 		"list":   false,
 		"delete": false,
 		"rotate": false,
@@ -29,6 +30,19 @@ func TestApikeyCmd_Structure(t *testing.T) {
 	for name, found := range subcommands {
 		if !found {
 			t.Errorf("missing subcommand %q", name)
+		}
+	}
+}
+
+func TestApikeyEnsureCmd_RequiredFlags(t *testing.T) {
+	cmd := apikeyEnsureCmd()
+	for _, name := range []string{"name", "token-env"} {
+		flag := cmd.Flags().Lookup(name)
+		if flag == nil {
+			t.Fatalf("missing --%s flag", name)
+		}
+		if _, ok := flag.Annotations[cobra.BashCompOneRequiredFlag]; !ok {
+			t.Errorf("--%s should be marked as required", name)
 		}
 	}
 }

@@ -1,0 +1,49 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "fastclaw-aiphabee-staging",
+  "account_id": "ab66185011440a6f8a698d61ad58703a",
+  "main": "src/worker.mjs",
+  "compatibility_date": "2026-07-10",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": {
+    "enabled": true
+  },
+  "vars": {
+    "FASTCLAW_INSTANCE_NAME": "fastclaw-aiphabee-staging",
+    "FASTCLAW_STORAGE_TYPE": "postgres",
+    "FASTCLAW_STORAGE_AUTO_MIGRATE": "true",
+    "FASTCLAW_BIND": "all",
+    "FASTCLAW_PORT": "18953",
+    "FASTCLAW_SANDBOX_ENABLED": "false",
+    "FASTCLAW_OBJECT_STORE_TYPE": "cloudflare-r2",
+    "FASTCLAW_OBJECT_STORE_BUCKET": "aiphabee-fastclaw-staging",
+    "FASTCLAW_OBJECT_STORE_PREFIX": "fastclaw-aiphabee-staging",
+    "FASTCLAW_OBJECT_STORE_ACCOUNTID": "ab66185011440a6f8a698d61ad58703a",
+    "FASTCLAW_OBJECT_STORE_USESSL": "true"
+  },
+  "containers": [
+    {
+      "class_name": "FastClawAiphaBeeContainer",
+      "image": "../../../Dockerfile",
+      "image_build_context": "../../..",
+      "instance_type": "standard-1",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "class_name": "FastClawAiphaBeeContainer",
+        "name": "FASTCLAW_AIPHABEE_CONTAINER"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "new_sqlite_classes": ["FastClawAiphaBeeContainer"],
+      "tag": "v1"
+    }
+  ]
+}

@@ -1378,7 +1378,8 @@ func (d *DBStore) tableHasColumn(ctx context.Context, table, column string) (boo
 	if d.dialect == "postgres" {
 		row := d.db.QueryRowContext(ctx,
 			`SELECT 1 FROM information_schema.columns
-				WHERE table_name = $1 AND column_name = $2 LIMIT 1`,
+				WHERE table_schema = current_schema()
+					AND table_name = $1 AND column_name = $2 LIMIT 1`,
 			table, column)
 		var x int
 		if err := row.Scan(&x); err != nil {

@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 
+	"github.com/fastclaw-ai/fastclaw/internal/store"
 	"github.com/fastclaw-ai/fastclaw/internal/users"
 )
 
@@ -15,10 +17,74 @@ func apikeyCmd() *cobra.Command {
 		Short: "Manage API keys (create, list, delete, rotate)",
 	}
 	cmd.AddCommand(apikeyCreateCmd())
+	cmd.AddCommand(apikeyEnsureCmd())
 	cmd.AddCommand(apikeyListCmd())
 	cmd.AddCommand(apikeyDeleteCmd())
 	cmd.AddCommand(apikeyRotateCmd())
 	return cmd
+}
+
+func apikeyEnsureCmd() *cobra.Command {
+	var name, owner, tokenEnv string
+	cmd := &cobra.Command{
+		Use:   "ensure",
+		Short: "Create or update a named admin API key from an environment secret",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			st, err := openStoreFromEnv()
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			owner, err = resolveAPIKeyOwner(context.Background(), st, owner)
+			if err != nil {
+				return err
+			}
+			token := os.Getenv(tokenEnv)
+			if token == "" {
+				return fmt.Errorf("environment variable %s is empty", tokenEnv)
+			}
+			keys, err := users.NewAPIKeys(st)
+			if err != nil {
+				return err
+			}
+			rec, created, err := keys.EnsureAdminToken(context.Background(), owner, name, token)
+			if err != nil {
+				return err
+			}
+			verb := "updated"
+			if created {
+				verb = "created"
+			}
+			fmt.Printf("%s admin apikey id=%s name=%s owner=%s\n", verb, rec.ID, name, owner)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&name, "name", "", "key name (required)")
+	cmd.Flags().StringVar(&owner, "owner", "", "owner user ID (defaults to first super_admin)")
+	cmd.Flags().StringVar(&tokenEnv, "token-env", "", "environment variable containing an fc_ token (required)")
+	cmd.MarkFlagRequired("name")
+	cmd.MarkFlagRequired("token-env")
+	return cmd
+}
+
+func resolveAPIKeyOwner(ctx context.Context, st store.Store, owner string) (string, error) {
+	if owner != "" {
+		return owner, nil
+	}
+	accounts, err := users.NewAccounts(st)
+	if err != nil {
+		return "", err
+	}
+	list, err := accounts.List(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, user := range list {
+		if user.Role == users.RoleSuperAdmin {
+			return user.ID, nil
+		}
+	}
+	return "", fmt.Errorf("no super_admin found; use --owner to specify user ID")
 }
 
 func apikeyCreateCmd() *cobra.Command {
