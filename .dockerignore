@@ -2,6 +2,7 @@ bin/
 dist/
 tmp/
 web/node_modules/
+deploy/**/node_modules/
 web/.next/
 web/out/
 internal/setup/web/

@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/fastclaw-ai/fastclaw/internal/store"
@@ -122,6 +124,82 @@ func (k *APIKeys) Create(ctx context.Context, userID, name, keyType string, agen
 	out := toAPIKey(rec)
 	out.Key = token
 	return out, token, nil
+}
+
+// EnsureAdminToken creates or updates one named admin API key from an
+// operator-provided 256-bit token. Secret-managed deployments use this to
+// bootstrap deterministically without printing plaintext credentials.
+func (k *APIKeys) EnsureAdminToken(ctx context.Context, userID, name, token string) (*APIKey, bool, error) {
+	if userID == "" {
+		return nil, false, errors.New("users.APIKeys.EnsureAdminToken: userID is required")
+	}
+	if strings.TrimSpace(name) == "" {
+		return nil, false, errors.New("users.APIKeys.EnsureAdminToken: name is required")
+	}
+	if err := validateManagedToken(token); err != nil {
+		return nil, false, err
+	}
+	owner, err := k.store.GetUser(ctx, userID)
+	if err != nil {
+		return nil, false, err
+	}
+	if owner.Role != RoleSuperAdmin {
+		return nil, false, errors.New("users.APIKeys.EnsureAdminToken: owner must be super_admin")
+	}
+	recs, err := k.store.ListAPIKeys(ctx, userID)
+	if err != nil {
+		return nil, false, err
+	}
+	var existing *store.APIKeyRecord
+	for i := range recs {
+		if recs[i].Name != name {
+			continue
+		}
+		if existing != nil {
+			return nil, false, fmt.Errorf("users.APIKeys.EnsureAdminToken: multiple keys named %q", name)
+		}
+		existing = &recs[i]
+	}
+	if existing != nil {
+		if existing.Type != APIKeyTypeAdmin {
+			return nil, false, fmt.Errorf("users.APIKeys.EnsureAdminToken: key %q is type %q, want admin", name, existing.Type)
+		}
+		if err := k.store.RotateAPIKey(ctx, existing.ID, hashToken(token), keyPrefix(token)); err != nil {
+			return nil, false, err
+		}
+		existing.KeyPrefix = keyPrefix(token)
+		return toAPIKey(existing), false, nil
+	}
+
+	id, err := newID("k_")
+	if err != nil {
+		return nil, false, err
+	}
+	rec := &store.APIKeyRecord{
+		ID:        id,
+		UserID:    userID,
+		Name:      name,
+		KeyHash:   hashToken(token),
+		KeyPrefix: keyPrefix(token),
+		Type:      APIKeyTypeAdmin,
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := k.store.CreateAPIKey(ctx, rec); err != nil {
+		return nil, false, err
+	}
+	return toAPIKey(rec), true, nil
+}
+
+func validateManagedToken(token string) error {
+	if len(token) != 67 || !strings.HasPrefix(token, "fc_") {
+		return errors.New("users.APIKeys.EnsureAdminToken: token must be fc_ followed by 64 lowercase hex characters")
+	}
+	raw := token[3:]
+	decoded, err := hex.DecodeString(raw)
+	if raw != strings.ToLower(raw) || err != nil || len(decoded) != 32 {
+		return errors.New("users.APIKeys.EnsureAdminToken: token must be fc_ followed by 64 lowercase hex characters")
+	}
+	return nil
 }
 
 // Rotate replaces the apikey's token. Old token stops working immediately.

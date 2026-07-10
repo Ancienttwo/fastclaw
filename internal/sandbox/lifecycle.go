@@ -245,6 +245,27 @@ func (p *LifecyclePool) Release(agentID, projectID, sessionID string) error {
 	return p.inner.Release(agentID, projectID, sessionID)
 }
 
+// ForgetExternallyManaged drops lifecycle bookkeeping only when the inner
+// provider explicitly declares an external cleanup owner. Other providers are
+// left untouched so an untrusted transport header cannot bypass their normal
+// destroy path.
+func (p *LifecyclePool) ForgetExternallyManaged(agentID, projectID, sessionID string) bool {
+	inner, ok := p.inner.(ExternallyManagedExecutorPool)
+	if !ok {
+		return false
+	}
+	if !inner.ForgetExternallyManaged(agentID, projectID, sessionID) {
+		return false
+	}
+	k := poolKey(agentID, projectID, sessionID)
+	p.mu.Lock()
+	delete(p.lastUsed, k)
+	delete(p.hydrated, k)
+	delete(p.scopes, k)
+	p.mu.Unlock()
+	return true
+}
+
 // CloseAll stops the sweeper and tears down every live sandbox. Called on
 // gateway shutdown; skipping this would leak E2B instances that cost money
 // until their max-TTL expires.

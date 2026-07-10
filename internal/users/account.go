@@ -29,9 +29,9 @@ import (
 // end-user. There is intentionally no fine-grained scheme — anything
 // more complex lives in the apikey ACL layer.
 const (
-	RoleSuperAdmin = "super_admin"
-	RoleUser       = "user"
-	RoleAppUser    = "app_user"
+	RoleSuperAdmin  = "super_admin"
+	RoleUser        = "user"
+	RoleAppUser     = "app_user"
 	RoleChannelUser = "channel_user"
 )
 
@@ -44,6 +44,13 @@ const (
 // ErrInvalidCredentials masks "no such user" and "wrong password" so the
 // login handler can't be used as an email-existence oracle.
 var ErrInvalidCredentials = errors.New("invalid credentials")
+
+// ErrAccountDisabled is returned only on authenticated upstream app-user
+// switching/provisioning paths. The upstream application already owns the
+// external id, so surfacing this state does not create a user-enumeration
+// oracle; it lets callers fail closed instead of silently running as the API
+// key owner.
+var ErrAccountDisabled = errors.New("account disabled")
 
 // Account is the public representation of a user row. PasswordHash never
 // leaves the package — we read it during Authenticate and zero it out
@@ -347,6 +354,9 @@ func (a *Accounts) EnsureAppUser(ctx context.Context, ownerUserID, externalID, d
 	}
 	// Fast path — already provisioned.
 	if rec, err := a.store.GetUserByExternal(ctx, ownerUserID, externalID); err == nil {
+		if rec.Status != StatusActive {
+			return nil, ErrAccountDisabled
+		}
 		return toAccount(rec), nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return nil, err
@@ -370,6 +380,9 @@ func (a *Accounts) EnsureAppUser(ctx context.Context, ownerUserID, externalID, d
 	}
 	if err := a.store.CreateUser(ctx, rec); err != nil {
 		if again, qerr := a.store.GetUserByExternal(ctx, ownerUserID, externalID); qerr == nil {
+			if again.Status != StatusActive {
+				return nil, ErrAccountDisabled
+			}
 			return toAccount(again), nil
 		}
 		return nil, err
@@ -423,15 +436,18 @@ func (a *Accounts) EnsureChatter(ctx context.Context, ownerUserID, externalID, d
 // Delete removes an account and its owned rows (cascade implemented in the
 // store). Refuses to drop the last super_admin so the install doesn't lock
 // itself out.
-func (a *Accounts) Delete(ctx context.Context, id string) error {
+func (a *Accounts) Delete(ctx context.Context, id string) (bool, error) {
 	target, err := a.store.GetUser(ctx, id)
 	if err != nil {
-		return err
+		if errors.Is(err, store.ErrNotFound) {
+			return false, nil
+		}
+		return false, err
 	}
 	if target.Role == RoleSuperAdmin {
 		all, err := a.store.ListUsers(ctx)
 		if err != nil {
-			return err
+			return false, err
 		}
 		admins := 0
 		for _, u := range all {
@@ -440,10 +456,13 @@ func (a *Accounts) Delete(ctx context.Context, id string) error {
 			}
 		}
 		if admins <= 1 {
-			return errors.New("users.Delete: refusing to remove the last active super_admin")
+			return false, errors.New("users.Delete: refusing to remove the last active super_admin")
 		}
 	}
-	return a.store.DeleteUser(ctx, id)
+	if err := a.store.DeleteUser(ctx, id); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func toAccount(r *store.UserRecord) *Account {

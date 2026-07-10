@@ -84,6 +84,8 @@ func ensureGatewayRunning() {
 	fmt.Printf("URL:      http://localhost:%d\n", port)
 }
 
+var ensureGatewayAfterAgentInit = ensureGatewayRunning
+
 func agentsListCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:     "ls",
@@ -114,6 +116,7 @@ func agentsListCmd() *cobra.Command {
 
 func agentsInitCmd() *cobra.Command {
 	var opts agentcli.InitOptions
+	var noStart bool
 	cmd := &cobra.Command{
 		Use:     "init <name>",
 		Aliases: []string{"create", "new", "add"},
@@ -153,11 +156,14 @@ func agentsInitCmd() *cobra.Command {
 			if res.OwnerCreated && res.GeneratedPassword != "" {
 				fmt.Printf("Created user %q with password: %s\n", res.OwnerUsername, res.GeneratedPassword)
 			}
-			ensureGatewayRunning()
+			if !noStart {
+				ensureGatewayAfterAgentInit()
+			}
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&opts.AgentID, "id", "", "agent id (default: auto-generated; pass an existing agt_ id to update an agent created via the dashboard)")
+	cmd.Flags().BoolVar(&opts.Ensure, "ensure", false, "idempotently create or update the exact agent id supplied with --id")
 	cmd.Flags().StringVar(&opts.Description, "description", "", "description for the agent")
 	cmd.Flags().StringVar(&opts.Provider, "provider", "", "provider name, e.g. openai, openrouter, anthropic, ollama")
 	cmd.Flags().StringVar(&opts.Model, "model", "", "default model, either <provider>/<model> or <model> with --provider")
@@ -169,6 +175,7 @@ func agentsInitCmd() *cobra.Command {
 	cmd.Flags().StringVar(&opts.Email, "email", "", "owner email when the user is being created")
 	cmd.Flags().StringVar(&opts.Password, "password", "", "owner password when the user is being created (default: generate)")
 	cmd.Flags().StringVar(&opts.DisplayName, "display-name", "", "admin display name")
+	cmd.Flags().BoolVar(&noStart, "no-start", false, "do not auto-start or reload the gateway after initialization")
 	return cmd
 }
 

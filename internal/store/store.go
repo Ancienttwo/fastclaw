@@ -57,6 +57,8 @@ type Store interface {
 	// --- Agents (atomic; agents.id is globally unique) ---
 	ListAgents(ctx context.Context, ownerUserID string) ([]AgentRecord, error)
 	GetAgent(ctx context.Context, agentID string) (*AgentRecord, error)
+	GetAgentByExternal(ctx context.Context, ownerUserID, externalID string) (*AgentRecord, error)
+	CreateAgentIdempotent(ctx context.Context, agent *AgentRecord) (*AgentRecord, bool, error)
 	SaveAgent(ctx context.Context, agent *AgentRecord) error
 	DeleteAgent(ctx context.Context, agentID string) error
 	ListAllAgents(ctx context.Context) ([]AgentRecord, error)
@@ -356,13 +358,14 @@ type APIKeyRecord struct {
 // into their own UserSpace; sessions/memory/agent_files still
 // partition per chatter, so only the agent identity is shared.
 type AgentRecord struct {
-	ID        string                 `json:"id"`
-	UserID    string                 `json:"userId"`
-	Name      string                 `json:"name"`
-	Config    map[string]interface{} `json:"config,omitempty"`
-	IsPublic  bool                   `json:"isPublic"`
-	CreatedAt time.Time              `json:"createdAt"`
-	UpdatedAt time.Time              `json:"updatedAt"`
+	ID         string                 `json:"id"`
+	UserID     string                 `json:"userId"`
+	ExternalID string                 `json:"externalId,omitempty"`
+	Name       string                 `json:"name"`
+	Config     map[string]interface{} `json:"config,omitempty"`
+	IsPublic   bool                   `json:"isPublic"`
+	CreatedAt  time.Time              `json:"createdAt"`
+	UpdatedAt  time.Time              `json:"updatedAt"`
 }
 
 // SessionRecord holds a conversation session.
@@ -562,10 +565,10 @@ type ConfigRecord struct {
 // ChannelRecord is one row of the channels table — a bound IM bot.
 type ChannelRecord struct {
 	ID             string                 `json:"id"`
-	UserID         string                 `json:"userId"`          // who bound this channel
-	AgentID        string                 `json:"agentId"`         // which agent it routes to
-	Type           string                 `json:"type"`            // wechat / telegram / discord / slack / line / feishu
-	AccountID      string                 `json:"accountId"`       // bot unique identifier (credential_key equivalent)
+	UserID         string                 `json:"userId"`    // who bound this channel
+	AgentID        string                 `json:"agentId"`   // which agent it routes to
+	Type           string                 `json:"type"`      // wechat / telegram / discord / slack / line / feishu
+	AccountID      string                 `json:"accountId"` // bot unique identifier (credential_key equivalent)
 	Enabled        bool                   `json:"enabled"`
 	BotToken       string                 `json:"botToken,omitempty"`
 	BaseURL        string                 `json:"baseUrl,omitempty"`

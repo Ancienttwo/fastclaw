@@ -1,0 +1,16 @@
+{
+  "name": "@fastclaw/deploy-cloudflare-aiphabee",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy:staging": "wrangler deploy",
+    "test": "node --test src/*.test.mjs"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "0.3.7"
+  },
+  "devDependencies": {
+    "wrangler": "4.110.0"
+  }
+}

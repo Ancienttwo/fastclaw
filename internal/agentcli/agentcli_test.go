@@ -164,6 +164,52 @@ func TestInitExplicitMissingIDDoesNotFallbackToName(t *testing.T) {
 	}
 }
 
+func TestInitEnsureCreatesAndReusesExplicitID(t *testing.T) {
+	st := freshStore(t)
+	const agentID = "agt_aiphabee_template"
+
+	created, err := Init(context.Background(), st, "AiphaBee Template", InitOptions{
+		AgentID:     agentID,
+		Ensure:      true,
+		Description: "first",
+	})
+	if err != nil {
+		t.Fatalf("ensure create: %v", err)
+	}
+	if !created.Created || created.Agent.ID != agentID {
+		t.Fatalf("ensure create = (%+v, %v), want id %s created", created.Agent, created.Created, agentID)
+	}
+
+	updated, err := Init(context.Background(), st, "AiphaBee Template", InitOptions{
+		AgentID:     agentID,
+		Ensure:      true,
+		Description: "second",
+	})
+	if err != nil {
+		t.Fatalf("ensure update: %v", err)
+	}
+	if updated.Created || updated.Agent.ID != agentID {
+		t.Fatalf("ensure update = (%+v, %v), want same id updated", updated.Agent, updated.Created)
+	}
+	if updated.Agent.Config["description"] != "second" {
+		t.Fatalf("description not updated: %#v", updated.Agent.Config)
+	}
+}
+
+func TestInitEnsureRejectsNameCollision(t *testing.T) {
+	st := freshStore(t)
+	if _, err := Init(context.Background(), st, "AiphaBee Template", InitOptions{}); err != nil {
+		t.Fatalf("seed template: %v", err)
+	}
+	_, err := Init(context.Background(), st, "AiphaBee Template", InitOptions{
+		AgentID: "agt_aiphabee_template",
+		Ensure:  true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "refusing to replace") {
+		t.Fatalf("expected name-collision refusal, got %v", err)
+	}
+}
+
 func TestInitRejectsRebindToOtherUser(t *testing.T) {
 	st := freshStore(t)
 
@@ -513,9 +559,9 @@ func TestParseValueTypes(t *testing.T) {
 
 func TestSettingKeyRouting(t *testing.T) {
 	cases := []struct {
-		key           string
-		ns            string
-		path          []string
+		key            string
+		ns             string
+		path           []string
 		wantAgentScope bool
 	}{
 		{"model", "agents.defaults", []string{"model"}, true},
